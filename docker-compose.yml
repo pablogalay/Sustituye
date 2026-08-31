@@ -1,0 +1,42 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: substitutions
+      POSTGRES_USER: substitutions
+      POSTGRES_PASSWORD: substitutions
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U substitutions -d substitutions"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    volumes: [postgres_data:/var/lib/postgresql/data]
+  api:
+    build: ./backend
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://substitutions:substitutions@db:5432/substitutions
+      JWT_SECRET: ${JWT_SECRET:-change-this-secret-in-production}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@school.local}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin123}
+      SYNC_SERVICE_URL: http://sync:8080
+      SYNC_TRIGGER_TOKEN: ${SYNC_TRIGGER_TOKEN:-change-this-token-in-production}
+    depends_on:
+      db: { condition: service_healthy }
+    ports: ["8000:8000"]
+  web:
+    build: ./frontend
+    depends_on: [api]
+    ports: ["3000:80"]
+  sync:
+    build: ./sync
+    env_file: .env
+    environment:
+      APP_API_URL: http://api:8000
+      SYNC_TRIGGER_TOKEN: ${SYNC_TRIGGER_TOKEN:-change-this-token-in-production}
+    volumes:
+      - ./sync/data:/app/data
+      - ./sync/config:/app/config:ro
+    depends_on: [api]
+volumes:
+  postgres_data:

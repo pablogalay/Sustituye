@@ -1,0 +1,14 @@
+{
+  "_comment": "Copy this file to field_mapping.json. The values must be the EXACT column header text as it appears in the LimeSurvey CSV export - for survey 266389 that turned out to be the Spanish display labels (Usuario, Fecha, Sesión...), not question codes. Run the sync once and check sync/data/*.log or dump a row to confirm the real headers if you point this at a different survey. 'weekday' is NOT listed here on purpose - it is derived automatically from 'date'. 'period' must be the survey's literal hour range answer, e.g. '10:15-11:10', matched against the app's TimeSlot hours. 'observations' is optional - omit the key entirely if the survey has no such question.",
+
+  "response_id_column": "ID de respuesta",
+
+  "columns": {
+    "username": "Usuario",
+    "date": "Fecha",
+    "period": "Sesión",
+    "class_group": "Grupo",
+    "classroom": "Aula",
+    "task_left": "Tareas"
+  }
+}
