@@ -293,6 +293,4 @@ pytest sync/tests          # cubre mapping.py y state_store.py sin red ni creden
 ---
 
 ## 📄 Licencia
-
-Sin licencia definida todavía. Añade un archivo `LICENSE` (por ejemplo MIT) antes de
-publicar el repositorio si quieres permitir su reutilización.
+MIT License
