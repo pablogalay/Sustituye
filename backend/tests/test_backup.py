@@ -87,7 +87,7 @@ def test_export_returns_structured_snapshot_with_all_tables():
     assert response.status_code == 200
     assert 'attachment' in response.headers['content-disposition']
     payload = response.json()
-    assert set(payload['tables'].keys()) == {'class_groups', 'classrooms', 'teachers', 'timeslots', 'availability', 'assignment_statistics', 'absences'}
+    assert set(payload['tables'].keys()) == {'class_groups', 'classrooms', 'teachers', 'timeslots', 'availability', 'assignment_statistics', 'absences', 'hallway_duties'}
     assert len(payload['tables']['teachers']) == 2
     assert payload['tables']['absences'][0]['task_left'] == 'Trabajo'
 

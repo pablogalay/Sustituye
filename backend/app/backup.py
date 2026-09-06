@@ -6,7 +6,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import DataError, IntegrityError
 from sqlalchemy.orm import Session
 from .database import get_db
-from .models import Absence, AssignmentStatistic, Availability, ClassGroup, Classroom, Teacher, TimeSlot
+from .models import Absence, AssignmentStatistic, Availability, ClassGroup, Classroom, HallwayDuty, Teacher, TimeSlot
 
 router = APIRouter(prefix='/backup', tags=['backup'])
 
@@ -22,6 +22,7 @@ TABLES = [
     ('availability', Availability),
     ('assignment_statistics', AssignmentStatistic),
     ('absences', Absence),
+    ('hallway_duties', HallwayDuty),
 ]
 
 

@@ -223,6 +223,34 @@ def test_update_teacher_enforces_minimum_password_length():
     assert response.status_code == 422
 
 
+# --- teacher duty_weight (part-time load balancing) --------------------------
+
+
+def test_new_teacher_defaults_to_a_full_duty_weight_of_one():
+    created = client.post('/teachers', headers=admin_headers(), json={'first_name': 'Def', 'last_name': 'Weight', 'email': 'defweight@x.test', 'active': True, 'password': 'validpassword123'}).json()
+    assert created['duty_weight'] == 1.0
+
+
+def test_teacher_duty_weight_can_be_set_above_one_for_part_time_staff():
+    created = client.post('/teachers', headers=admin_headers(), json={'first_name': 'Part', 'last_name': 'Weight', 'email': 'partweight@x.test', 'active': True, 'password': 'validpassword123', 'duty_weight': 1.5}).json()
+    assert created['duty_weight'] == 1.5
+    fetched = next(t for t in client.get('/teachers', headers=admin_headers()).json() if t['id'] == created['id'])
+    assert fetched['duty_weight'] == 1.5
+
+
+@pytest.mark.parametrize('duty_weight', [0, -1, -0.5])
+def test_teacher_duty_weight_must_be_positive(duty_weight):
+    payload = {'first_name': 'Bad', 'last_name': 'Weight', 'email': f'badweight-{duty_weight}@x.test', 'active': True, 'password': 'validpassword123', 'duty_weight': duty_weight}
+    assert client.post('/teachers', headers=admin_headers(), json=payload).status_code == 422
+
+
+def test_update_teacher_can_change_duty_weight():
+    created = client.post('/teachers', headers=admin_headers(), json={'first_name': 'Chg', 'last_name': 'Weight', 'email': 'chgweight@x.test', 'active': True, 'password': 'validpassword123'}).json()
+    response = client.put(f'/teachers/{created["id"]}', headers=admin_headers(), json={'first_name': 'Chg', 'last_name': 'Weight', 'email': 'chgweight@x.test', 'active': True, 'duty_weight': 2})
+    assert response.status_code == 200
+    assert response.json()['duty_weight'] == 2
+
+
 @pytest.mark.parametrize('duty_type', ['FOO', '', 'guard', 'Support', None])
 def test_set_availability_rejects_invalid_duty_type(duty_type):
     response = client.put('/availability', headers=admin_headers(), json={'teacher_id': TEACHER_ONE, 'entries': [{'timeslot_id': TIMESLOT_MONDAY, 'duty_type': duty_type}]})
@@ -403,3 +431,31 @@ def test_dashboard_counts_covering_and_unassigned_absences():
     assert response.status_code == 200
     body = response.json()
     assert body['absence_count'] == body['covering_count'] + body['unassigned_count']
+
+
+# --- corridor guard duties ---------------------------------------------------
+
+
+def test_hallway_duties_roster_is_generated_on_read_for_the_requested_day():
+    for teacher in (TEACHER_ONE, TEACHER_TWO):
+        client.put('/availability', headers=admin_headers(), json={'teacher_id': teacher, 'entries': [{'timeslot_id': TIMESLOT_MONDAY, 'duty_type': 'GUARD'}]})
+
+    body = client.get('/hallway-duties', headers=admin_headers(), params={'day': '2026-09-07'}).json()
+
+    assert [x['post'] for x in body['posts']] == ['GROUND', 'FIRST', 'SECOND']
+    monday = [x for x in body['duties'] if x['timeslot_id'] == TIMESLOT_MONDAY]
+    assert [x['post'] for x in monday] == ['GROUND', 'FIRST', 'SECOND']
+    assert monday[0]['label'] == 'Pasillo planta baja'
+    staffed = [x['teacher_id'] for x in monday if x['teacher_id'] is not None]
+    # Posts are filled from the ground floor upwards, so the empty ones are always
+    # the last, and nobody covers two corridors in the same session.
+    assert [x['teacher_id'] for x in monday][:len(staffed)] == staffed
+    assert len(set(staffed)) == len(staffed) >= 1
+
+
+def test_hallway_duties_are_visible_to_teachers():
+    assert client.get('/hallway-duties', headers=teacher_headers(), params={'day': '2026-09-07'}).status_code == 200
+
+
+def test_saturday_has_no_corridor_duties():
+    assert client.get('/hallway-duties', headers=admin_headers(), params={'day': '2026-09-12'}).json()['duties'] == []

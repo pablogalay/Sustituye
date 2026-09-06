@@ -1,5 +1,5 @@
 from datetime import date, time, datetime
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 class TeacherIn(BaseModel):
     first_name: str
     last_name: str
@@ -9,12 +9,17 @@ class TeacherIn(BaseModel):
     email: str
     active: bool = True
     password: str | None = None
+    # How much each guard duty counts for this teacher's load-balancing counters.
+    # Above 1 for part-time staff so they accumulate load faster per duty and are
+    # picked less often than full-time colleagues.
+    duty_weight: float = Field(1.0, gt=0)
 class TeacherOut(BaseModel):
     id: int
     first_name: str
     last_name: str
     email: str
     active: bool
+    duty_weight: float
     model_config=ConfigDict(from_attributes=True)
 class TimeSlotOut(BaseModel): id:int; weekday:str; period_number:int; start_time:time; end_time:time; model_config=ConfigDict(from_attributes=True)
 class AvailabilityEntryIn(BaseModel):

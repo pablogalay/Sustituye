@@ -61,7 +61,9 @@ PDF de guardias y apoyos.
 
 | Área | Detalle |
 |------|---------|
-| **Asignación automática** | Elige entre el profesorado de **Guardia** disponible; solo recurre a **Apoyo** cuando no hay ninguna Guardia libre. Desempata al azar entre quienes tienen el contador más bajo en esa sesión. |
+| **Asignación automática** | Elige entre el profesorado de **Guardia** disponible; solo recurre a **Apoyo** cuando no hay ninguna Guardia libre. Desempata al azar entre quienes tienen el contador **ponderado** más bajo en esa sesión. |
+| **Peso de guardia por profesor/a** | Cada docente tiene un **peso de guardia** (1 por defecto) configurable en Profesorado. Con un peso superior a 1 (p. ej. 1,5 para media jornada), cada guardia realizada cuenta más en su contador, por lo que se le asignan menos. |
+| **Guardias de pasillo** | Además de las sustituciones, cada sesión reserva **tres puestos de pasillo** (planta baja, primera y segunda planta) que se cubren en ese orden con el profesorado que queda libre. |
 | **Reasignación en cascada** | Si quien se ausenta ya estaba cubriendo otra sustitución esa misma franja, esa cobertura se libera y se reasigna con prioridad. |
 | **Matriz de disponibilidad** | Rejilla semanal de 7 sesiones × 5 días para marcar cada docente como Guardia (G) o Apoyo (A) por franja. |
 | **Portal del profesorado** | Cada docente entra con su email y contraseña y solo puede **comunicar su propia ausencia** y ver sus coberturas. |
@@ -167,14 +169,59 @@ Para cada ausencia registrada, la API:
 1. Reúne al profesorado **activo** con disponibilidad en esa sesión, **excluyendo** a quien
    se ausenta y a quien ya cubre otra sustitución esa fecha/franja.
 2. Considera primero a las **Guardias**; solo si ninguna está libre pasa a los **Apoyos**.
-3. Entre las personas elegibles, elige **al azar** entre las que tienen el **contador más
-   bajo** para esa sesión.
+3. Entre las personas elegibles, elige **al azar** entre las que tienen el **contador
+   ponderado más bajo** para esa sesión (ver [peso de guardia](#peso-de-guardia-media-jornada)
+   más abajo).
 4. Incrementa ese contador **de forma atómica** en la misma transacción (`SELECT ... FOR
-   UPDATE`), de modo que dos ausencias simultáneas no compitan por la misma persona.
+   UPDATE`), sumando el **peso de guardia** de la persona elegida (1 por defecto) en vez de
+   siempre sumar 1, de modo que dos ausencias simultáneas no compitan por la misma persona.
 5. Si nadie es elegible, la ausencia queda **sin asignar** y aparece como *pendiente*.
 
 Si la persona ausente ya estaba asignada como sustituta en esa misma franja, esa cobertura
-se libera primero y se reasigna con prioridad antes de resolver la ausencia nueva.
+se libera primero (restando su peso del contador) y se reasigna con prioridad antes de
+resolver la ausencia nueva.
+
+### Peso de guardia (media jornada)
+
+Cada docente tiene un **peso de guardia** configurable en **Profesorado** (1 por defecto).
+Este valor multiplica lo que cuenta **cada guardia realizada** —sustitución o guardia de
+pasillo— en su contador de carga:
+
+- Con peso **1** (jornada completa), cada guardia suma 1 al contador, igual que antes.
+- Con peso **1,5**, por ejemplo, cada guardia suma 1,5: tras la misma cantidad de guardias
+  reales, su contador queda más alto que el de un compañero a jornada completa, así que la
+  próxima vez se prioriza a quien tiene el contador más bajo, y a quien tiene un peso mayor
+  se le asignan menos guardias en total.
+- El peso se aplica **por igual a sustituciones y a guardias de pasillo**, cada una con su
+  propio contador pero la misma fórmula.
+- Cambiar el peso de un profesor/a no reescribe su historial: solo afecta a las guardias que
+  se asignen a partir de ese momento.
+
+### Guardias de pasillo
+
+Toda sesión tiene, además de las sustituciones, **tres puestos de pasillo** que se cubren
+**siempre que quede profesorado libre**, en este orden:
+
+1. **Pasillo planta baja**
+2. **Pasillo primera planta**
+3. **Pasillo segunda planta**
+
+- Se reparten entre quienes tienen Guardia o Apoyo en esa sesión y **no** están ausentes ni
+  cubriendo una clase; se recurre a los **Apoyos** solo cuando no queda ninguna Guardia libre.
+- **Cubrir una clase tiene prioridad**: si alguien con puesto de pasillo pasa a sustituir (o
+  se ausenta), deja el puesto y este se vuelve a cubrir con otra persona libre. Al eliminar
+  una ausencia, quien queda liberado vuelve a entrar en el reparto.
+- Si no queda nadie libre, los puestos que sobran se quedan **sin cubrir** en lugar de doblar
+  a alguien: nadie ocupa dos puestos en la misma sesión.
+- El reparto usa su **propio contador** (independiente del de sustituciones), ponderado por
+  el mismo [peso de guardia](#peso-de-guardia-media-jornada) de cada docente, y elige al azar
+  entre quienes acumulan menos.
+- Los puestos ya asignados **no se reorganizan** si la persona sigue libre, de modo que un
+  cuadrante ya publicado solo cambia en lo imprescindible.
+
+El cuadrante está en **Guardias de pasillo** (con selector de día, para administración y
+profesorado) y en el **Resumen del día**; se genera solo al consultarlo, sin ninguna acción
+manual.
 
 La matriz de disponibilidad admite **7 sesiones diarias** de lunes a viernes. La página de
 **Estadísticas** permite descargar un **PDF** con las guardias y apoyos de cada docente por
@@ -236,7 +283,7 @@ AppGema/
 │   │   ├── auth.py            # Hash PBKDF2 + JWT
 │   │   ├── backup.py          # Exportar / importar base de datos
 │   │   └── seed.py            # Datos de ejemplo
-│   ├── alembic/               # Migraciones (001 … 004)
+│   ├── alembic/               # Migraciones (001 … 006)
 │   └── tests/                 # pytest
 ├── frontend/                  # SPA React 18 + MUI (Vite)
 │   ├── src/main.tsx

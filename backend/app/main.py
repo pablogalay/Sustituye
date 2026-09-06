@@ -16,9 +16,9 @@ from sqlalchemy.orm import Session
 from .auth import hash_password, login, verify
 from .backup import router as backup_router
 from .database import get_db
-from .models import Absence, AssignmentStatistic, Availability, ClassGroup, Classroom, Teacher, TimeSlot
+from .models import Absence, AssignmentStatistic, Availability, ClassGroup, Classroom, HallwayDuty, Teacher, TimeSlot
 from .schemas import AbsenceIn, AbsenceOut, AvailabilityIn, LoginIn, TeacherIn, TeacherOut, TimeSlotOut
-from .services import assign_substitute, send_substitution_email
+from .services import HALLWAY_POST_LABELS, HALLWAY_POSTS, assign_hallway_duties, assign_substitute, ensure_hallway_duties_for_date, release_substitute_credit, send_substitution_email
 app=FastAPI(title='Teacher Substitution Manager')
 app.add_middleware(CORSMiddleware,allow_origins=['http://localhost:3000','http://localhost:5173'],allow_methods=['*'],allow_headers=['*'])
 app.include_router(backup_router)
@@ -65,6 +65,7 @@ def delete_teacher(teacher_id:int,request:Request,db:Session=Depends(get_db)):
         raise HTTPException(409,'No se puede eliminar este profesor porque tiene ausencias o sustituciones asociadas')
     db.query(Availability).filter(Availability.teacher_id==teacher_id).delete(synchronize_session=False)
     db.query(AssignmentStatistic).filter(AssignmentStatistic.teacher_id==teacher_id).delete(synchronize_session=False)
+    db.query(HallwayDuty).filter(HallwayDuty.teacher_id==teacher_id).delete(synchronize_session=False)
     db.delete(item)
     try:
         db.commit()
@@ -77,7 +78,12 @@ def delete_absence(absence_id:int,request:Request,db:Session=Depends(get_db)):
     require_admin(request)
     item=db.get(Absence,absence_id)
     if not item: raise HTTPException(404,'Absence not found')
+    day,timeslot_id=item.date,item.timeslot_id
     db.delete(item)
+    db.flush()
+    # The teacher who was absent (or covering this class) is free again, so the
+    # corridor posts of that session are staffed once more with everyone available.
+    assign_hallway_duties(db,day,timeslot_id)
     db.commit()
 @app.get('/timeslots',response_model=list[TimeSlotOut])
 def timeslots(db:Session=Depends(get_db)):
@@ -133,14 +139,17 @@ def create_absence(payload:AbsenceIn,request:Request,db:Session=Depends(get_db))
         Absence.id!=absence.id,
     )).all()
     for other in conflicting:
-        stat=db.get(AssignmentStatistic,(payload.absent_teacher_id,payload.timeslot_id))
-        if stat and stat.assignment_count>0: stat.assignment_count-=1
+        release_substitute_credit(db,payload.absent_teacher_id,payload.timeslot_id)
         other.substitute_teacher_id=None
         db.flush()
         other.substitute_teacher_id=assign_substitute(db,other)
         db.flush()
 
     absence.substitute_teacher_id=assign_substitute(db,absence)
+    db.flush()
+    # Covering a class always wins over a corridor post, so the posts of this
+    # session are recomputed only after every substitution has been resolved.
+    assign_hallway_duties(db,payload.date,payload.timeslot_id)
     db.commit(); db.refresh(absence)
     if absence.substitute_teacher_id is not None:
         send_substitution_email(db, absence, absence.substitute_teacher_id)
@@ -159,6 +168,18 @@ def absences(request:Request,date_from:date|None=None,date_to:date|None=None,tea
     if substitute_id:q=q.where(Absence.substitute_teacher_id==substitute_id)
     if group_id:q=q.where(Absence.class_group_id==group_id)
     return db.scalars(q).all()
+@app.get('/hallway-duties')
+def hallway_duties(request:Request,day:date|None=None,db:Session=Depends(get_db)):
+    """Corridor duty roster of one school day, visible to the whole staff.
+
+    The three posts of every session are (re)staffed on read, so the roster always
+    reflects the substitutions registered so far without anyone having to generate it.
+    """
+    target=day or date.today()
+    duties=ensure_hallway_duties_for_date(db,target)
+    db.commit()
+    return {'date':target,'posts':[{'post':post,'label':HALLWAY_POST_LABELS[post]} for post in HALLWAY_POSTS],
+            'duties':[{'id':x.id,'date':x.date,'timeslot_id':x.timeslot_id,'post':x.post,'label':HALLWAY_POST_LABELS.get(x.post,x.post),'teacher_id':x.teacher_id} for x in duties]}
 @app.post('/admin/sync-educamadrid')
 def sync_educamadrid(request:Request):
     """Triggers the EducaMadrid substitution sync service on demand. The service is
@@ -181,15 +202,17 @@ def reset_year(request:Request,db:Session=Depends(get_db)):
     require_admin(request)
     absences_deleted=db.query(Absence).delete(synchronize_session=False)
     statistics_deleted=db.query(AssignmentStatistic).delete(synchronize_session=False)
+    hallway_duties_deleted=db.query(HallwayDuty).delete(synchronize_session=False)
     db.commit()
-    return {'absences_deleted':absences_deleted,'statistics_deleted':statistics_deleted}
+    return {'absences_deleted':absences_deleted,'statistics_deleted':statistics_deleted,'hallway_duties_deleted':hallway_duties_deleted}
 @app.get('/statistics')
 def statistics(request:Request,db:Session=Depends(get_db)):
     user=request.state.user
     teachers=db.scalars(select(Teacher).order_by(Teacher.last_name)).all()
     if user.get('role') == 'teacher': teachers=[t for t in teachers if t.id==user.get('teacher_id')]
     slots={x.id:x for x in db.scalars(select(TimeSlot)).all()}; stats=db.scalars(select(AssignmentStatistic)).all()
-    return [{'teacher':{'id':t.id,'name':f'{t.first_name} {t.last_name}'},'total':sum(x.assignment_count for x in stats if x.teacher_id==t.id),'by_slot':[{'timeslot_id':x.timeslot_id,'label':f'{slots[x.timeslot_id].weekday} P{slots[x.timeslot_id].period_number}','count':x.assignment_count} for x in stats if x.teacher_id==t.id]} for t in teachers]
+    hallway={teacher_id:float(total or 0) for teacher_id,total in db.execute(select(HallwayDuty.teacher_id,func.sum(HallwayDuty.weight)).where(HallwayDuty.teacher_id.is_not(None)).group_by(HallwayDuty.teacher_id)).all()}
+    return [{'teacher':{'id':t.id,'name':f'{t.first_name} {t.last_name}','duty_weight':t.duty_weight},'total':sum(x.assignment_count for x in stats if x.teacher_id==t.id),'hallway_total':hallway.get(t.id,0),'by_slot':[{'timeslot_id':x.timeslot_id,'label':f'{slots[x.timeslot_id].weekday} P{slots[x.timeslot_id].period_number}','count':x.assignment_count} for x in stats if x.teacher_id==t.id]} for t in teachers]
 @app.get('/reports/guard-duty.pdf')
 def guard_duty_report(request:Request,db:Session=Depends(get_db)):
     require_admin(request)
@@ -221,4 +244,7 @@ def guard_duty_report(request:Request,db:Session=Depends(get_db)):
 def dashboard(request:Request,db:Session=Depends(get_db)):
     require_admin(request)
     today=date.today(); rows=db.scalars(select(Absence).where(Absence.date==today)).all()
-    return {'date':today,'substitutions':rows,'absence_count':len(rows),'covering_count':sum(x.substitute_teacher_id is not None for x in rows),'unassigned_count':sum(x.substitute_teacher_id is None for x in rows)}
+    duties=ensure_hallway_duties_for_date(db,today); db.commit()
+    return {'date':today,'substitutions':rows,'absence_count':len(rows),'covering_count':sum(x.substitute_teacher_id is not None for x in rows),'unassigned_count':sum(x.substitute_teacher_id is None for x in rows),
+            'hallway_duties':[{'timeslot_id':x.timeslot_id,'post':x.post,'label':HALLWAY_POST_LABELS.get(x.post,x.post),'teacher_id':x.teacher_id} for x in duties],
+            'hallway_uncovered_count':sum(x.teacher_id is None for x in duties)}
