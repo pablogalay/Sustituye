@@ -1,5 +1,6 @@
 import os
 from datetime import date
+from types import SimpleNamespace
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,9 +17,9 @@ from sqlalchemy.orm import Session
 from .auth import hash_password, login, verify
 from .backup import router as backup_router
 from .database import get_db
-from .models import Absence, AssignmentStatistic, Availability, ClassGroup, Classroom, HallwayDuty, Teacher, TimeSlot
-from .schemas import AbsenceIn, AbsenceOut, AvailabilityIn, LoginIn, TeacherIn, TeacherOut, TimeSlotOut
-from .services import HALLWAY_POST_LABELS, HALLWAY_POSTS, assign_hallway_duties, assign_substitute, ensure_hallway_duties_for_date, release_substitute_credit, send_substitution_email
+from .models import Absence, AssignmentStatistic, Availability, ClassGroup, Classroom, EmailLog, HallwayDuty, Teacher, TimeSlot
+from .schemas import AbsenceIn, AbsenceManualAssignIn, AbsenceOut, AbsenceUpdateIn, AdminAbsenceUpdateIn, AvailabilityIn, EmailLogOut, LoginIn, TeacherIn, TeacherOut, TimeSlotOut
+from .services import HALLWAY_POST_LABELS, HALLWAY_POSTS, assign_hallway_duties, assign_substitute, credit_manual_assignment, ensure_hallway_duties_for_date, release_substitute_credit, send_absence_updated_email, send_substitution_cancelled_email, send_substitution_email
 app=FastAPI(title='Teacher Substitution Manager')
 app.add_middleware(CORSMiddleware,allow_origins=['http://localhost:3000','http://localhost:5173'],allow_methods=['*'],allow_headers=['*'])
 app.include_router(backup_router)
@@ -78,13 +79,21 @@ def delete_absence(absence_id:int,request:Request,db:Session=Depends(get_db)):
     require_admin(request)
     item=db.get(Absence,absence_id)
     if not item: raise HTTPException(404,'Absence not found')
-    day,timeslot_id=item.date,item.timeslot_id
+    day,timeslot_id,substitute_teacher_id=item.date,item.timeslot_id,item.substitute_teacher_id
+    # Snapshot the details the cancellation email needs before the row is gone.
+    group=db.get(ClassGroup,item.class_group_id); classroom=db.get(Classroom,item.classroom_id)
+    cancelled=SimpleNamespace(id=item.id,date=item.date,timeslot_id=item.timeslot_id,absent_teacher_id=item.absent_teacher_id,
+        class_group=group.name if group else None,classroom=classroom.name if classroom else None)
     db.delete(item)
     db.flush()
+    # The substitution no longer exists, so the credit it earned the substitute
+    # teacher toward the weighted assignment counters must be given back.
+    if substitute_teacher_id is not None: release_substitute_credit(db,substitute_teacher_id,timeslot_id)
     # The teacher who was absent (or covering this class) is free again, so the
     # corridor posts of that session are staffed once more with everyone available.
     assign_hallway_duties(db,day,timeslot_id)
     db.commit()
+    if substitute_teacher_id is not None: send_substitution_cancelled_email(db,cancelled,substitute_teacher_id)
 @app.get('/timeslots',response_model=list[TimeSlotOut])
 def timeslots(db:Session=Depends(get_db)):
     weekdays=case({'Monday':1,'Tuesday':2,'Wednesday':3,'Thursday':4,'Friday':5},value=TimeSlot.weekday,else_=6)
@@ -158,6 +167,242 @@ def create_absence(payload:AbsenceIn,request:Request,db:Session=Depends(get_db))
         if other.substitute_teacher_id is not None:
             send_substitution_email(db, other, other.substitute_teacher_id)
     return absence
+@app.patch('/absences/{absence_id}/force-assign',response_model=AbsenceOut)
+def force_assign_absence(absence_id:int,payload:AbsenceManualAssignIn,request:Request,db:Session=Depends(get_db)):
+    """Lets an administrator force-assign ANY active teacher to a pending absence,
+    bypassing GUARD/SUPPORT availability entirely: classes must be covered in an
+    emergency even when nobody signed up for guard duty in that session. The weighted
+    duty counter is still credited exactly like an automatic assignment, so the extra
+    effort is remembered and the engine leans on this teacher less often afterwards.
+
+    If the chosen teacher is already covering a different absence in this same
+    date/session, that older assignment is released (its credit reversed) so nothing
+    is double-booked, and the automatic engine gets one attempt to backfill it before
+    it's left pending."""
+    require_admin(request)
+    absence=db.get(Absence,absence_id)
+    if not absence: raise HTTPException(404,'Absence not found')
+    if absence.substitute_teacher_id is not None: raise HTTPException(400,'Esta ausencia ya tiene una sustitución asignada')
+    substitute=db.get(Teacher,payload.substitute_id)
+    if not substitute: raise HTTPException(404,'Teacher not found')
+    if not substitute.active: raise HTTPException(422,'El profesor sustituto no está activo')
+    if substitute.id==absence.absent_teacher_id: raise HTTPException(422,'El profesor ausente no puede sustituirse a sí mismo')
+    if db.scalar(select(Absence.id).where(Absence.date==absence.date,Absence.timeslot_id==absence.timeslot_id,Absence.absent_teacher_id==substitute.id)):
+        raise HTTPException(422,'Ese profesor también está ausente en esta sesión y no puede cubrirla')
+
+    # The chosen teacher may already be covering a different absence in this same
+    # date/session; forcing them onto this one too would silently double their
+    # commitment, so that older assignment is released first (and, best-effort, refilled).
+    conflicting=db.scalar(select(Absence).where(
+        Absence.date==absence.date, Absence.timeslot_id==absence.timeslot_id,
+        Absence.substitute_teacher_id==substitute.id, Absence.id!=absence.id,
+    ))
+    if conflicting:
+        release_substitute_credit(db,substitute.id,absence.timeslot_id)
+        conflicting.substitute_teacher_id=None
+        db.flush()
+        conflicting.substitute_teacher_id=assign_substitute(db,conflicting)
+        db.flush()
+
+    absence.substitute_teacher_id=substitute.id
+    # Unconditional: credit_manual_assignment() doesn't check GUARD/SUPPORT availability,
+    # which is exactly the bypass this endpoint requires.
+    credit_manual_assignment(db,substitute.id,absence.timeslot_id)
+    db.flush()
+    # Covering a class always wins over a corridor post, so the posts of this
+    # session are recomputed in case the substitute (or whoever backfills the
+    # freed-up absence below) was staffing one.
+    assign_hallway_duties(db,absence.date,absence.timeslot_id)
+    db.commit(); db.refresh(absence)
+    # class_group/classroom are transient (not mapped columns); send_substitution_email
+    # reads them via getattr and falls back to 'no disponible' if they are not set.
+    group=db.get(ClassGroup,absence.class_group_id); classroom=db.get(Classroom,absence.classroom_id)
+    absence.class_group=group.name if group else None
+    absence.classroom=classroom.name if classroom else None
+    send_substitution_email(db,absence,substitute.id)
+    if conflicting:
+        db.refresh(conflicting)
+        if conflicting.substitute_teacher_id is not None:
+            send_substitution_email(db,conflicting,conflicting.substitute_teacher_id)
+    return absence
+@app.get('/sessions/{day}/{timeslot_id}/teachers-status')
+def teachers_status(day:date,timeslot_id:int,request:Request,db:Session=Depends(get_db)):
+    """Every active teacher's status for one date/session, so an administrator
+    force-assigning a substitute can see at a glance who already has guard/support
+    duty there, who's already committed elsewhere, and who is simply free to draft."""
+    require_admin(request)
+    if not db.get(TimeSlot,timeslot_id): raise HTTPException(404,'Session not found')
+    duty_by_teacher={x.teacher_id:x.duty_type for x in db.scalars(select(Availability).where(Availability.timeslot_id==timeslot_id))}
+    absent_ids=set(db.scalars(select(Absence.absent_teacher_id).where(Absence.date==day,Absence.timeslot_id==timeslot_id)))
+    busy_ids=set(db.scalars(select(Absence.substitute_teacher_id).where(Absence.date==day,Absence.timeslot_id==timeslot_id,Absence.substitute_teacher_id.is_not(None))))
+    def status_of(teacher_id:int)->str:
+        if teacher_id in absent_ids: return 'ABSENT'
+        if teacher_id in busy_ids: return 'BUSY'
+        duty=duty_by_teacher.get(teacher_id)
+        return duty if duty in ('GUARD','SUPPORT') else 'UNAVAILABLE'
+    teachers=db.scalars(select(Teacher).where(Teacher.active.is_(True)).order_by(Teacher.last_name)).all()
+    return [{'id':t.id,'first_name':t.first_name,'last_name':t.last_name,'status':status_of(t.id)} for t in teachers]
+@app.patch('/absences/{absence_id}',response_model=AbsenceOut)
+def update_absence(absence_id:int,payload:AbsenceUpdateIn,request:Request,db:Session=Depends(get_db)):
+    """Lets the teacher who reported an absence (or an administrator) correct the task
+    left for the group or the classroom after the fact — for example because they
+    forgot part of the instructions. date/timeslot/class_group are deliberately not
+    editable: changing any of them would mean recalculating availability and the
+    assigned substitute, so the teacher is expected to delete and recreate the
+    absence instead. If a substitute is already assigned, they are re-notified so
+    they don't show up with the outdated task or classroom."""
+    user=request.state.user
+    absence=db.get(Absence,absence_id)
+    if not absence: raise HTTPException(404,'Absence not found')
+    if user.get('role')=='teacher' and absence.absent_teacher_id!=user.get('teacher_id'):
+        raise HTTPException(403,'Solo puedes editar tus propias ausencias')
+    if absence.date<date.today():
+        raise HTTPException(409,'No se puede editar una ausencia de una fecha pasada')
+    task_left=payload.task_left.strip() if payload.task_left is not None else None
+    classroom_name=payload.classroom.strip() if payload.classroom is not None else None
+    if task_left is None and classroom_name is None:
+        raise HTTPException(422,'Debes indicar la tarea o el aula a modificar')
+    if task_left is not None:
+        if not task_left: raise HTTPException(422,'La tarea no puede estar vacía')
+        absence.task_left=task_left
+    if classroom_name is not None:
+        if not classroom_name: raise HTTPException(422,'El aula no puede estar vacía')
+        classroom=db.scalar(select(Classroom).where(Classroom.name==classroom_name))
+        if not classroom: classroom=Classroom(name=classroom_name); db.add(classroom); db.flush()
+        absence.classroom_id=classroom.id
+    db.commit(); db.refresh(absence)
+    if absence.substitute_teacher_id is not None:
+        # class_group/classroom are transient (not mapped columns); send_absence_updated_email
+        # reads them via getattr and falls back to 'no disponible' if they are not set.
+        group=db.get(ClassGroup,absence.class_group_id); classroom=db.get(Classroom,absence.classroom_id)
+        absence.class_group=group.name if group else None
+        absence.classroom=classroom.name if classroom else None
+        send_absence_updated_email(db,absence,absence.substitute_teacher_id)
+    return absence
+@app.put('/absences/{absence_id}',response_model=AbsenceOut)
+def admin_update_absence(absence_id:int,payload:AdminAbsenceUpdateIn,request:Request,db:Session=Depends(get_db)):
+    """Full administrative edit: date, session, group, classroom, task, observations and
+    the assigned substitute can all change in one action. Unlike the teacher-facing PATCH,
+    this bypasses GUARD/SUPPORT availability entirely (like force-assign) and allows
+    editing absences in the past, since it's a correction tool for administrators.
+
+    Keeps the weighted duty counters consistent across the edit ('el baile de
+    contadores'):
+      1. RELEASE — if the substitute or the date/session changes, whoever was assigned
+         before is released from their OLD (teacher, timeslot) counter and told their
+         assignment was cancelled, describing what they had originally signed up for.
+      2. UPDATE — the absence's fields are overwritten with the new values.
+      3. ASSIGN/NOTIFY — a genuinely new assignment (new substitute, or the same
+         substitute on a new date/session) credits the NEW counter and sends a
+         "new assignment" email; an unchanged substitute on an unchanged date/session
+         only gets a "details updated" email if the task/classroom/group/observations
+         changed. A no-op save (nothing actually different) sends nothing.
+    Every mutation from here through the commit is wrapped so a failure rolls back
+    instead of leaving a half-applied edit with corrupted counters.
+    """
+    require_admin(request)
+    absence=db.get(Absence,absence_id)
+    if not absence: raise HTTPException(404,'Absence not found')
+    if not db.get(TimeSlot,payload.timeslot_id): raise HTTPException(404,'Session not found')
+
+    group_name=payload.class_group.strip(); classroom_name=payload.classroom.strip(); task_left=payload.task_left.strip()
+    if not group_name or not classroom_name or not task_left: raise HTTPException(422,'Group, classroom and task are required')
+
+    new_substitute=None
+    if payload.substitute_id is not None:
+        new_substitute=db.get(Teacher,payload.substitute_id)
+        if not new_substitute: raise HTTPException(404,'Substitute teacher not found')
+        if not new_substitute.active: raise HTTPException(422,'El profesor sustituto no está activo')
+        if new_substitute.id==absence.absent_teacher_id: raise HTTPException(422,'El profesor ausente no puede sustituirse a sí mismo')
+        if db.scalar(select(Absence.id).where(Absence.date==payload.date,Absence.timeslot_id==payload.timeslot_id,Absence.absent_teacher_id==new_substitute.id)):
+            raise HTTPException(422,'Ese profesor también está ausente en esa sesión y no puede cubrirla')
+
+    # Snapshot everything the cancellation email needs before anything is mutated: it
+    # must describe what the previous substitute originally signed up to cover, not the
+    # (possibly different) new date/session/group/classroom.
+    old_date,old_timeslot_id,old_substitute_id=absence.date,absence.timeslot_id,absence.substitute_teacher_id
+    old_group=db.get(ClassGroup,absence.class_group_id); old_classroom=db.get(Classroom,absence.classroom_id)
+    old_snapshot=SimpleNamespace(id=absence.id,date=old_date,timeslot_id=old_timeslot_id,absent_teacher_id=absence.absent_teacher_id,
+        class_group=old_group.name if old_group else None,classroom=old_classroom.name if old_classroom else None)
+
+    session_changed=payload.date!=old_date or payload.timeslot_id!=old_timeslot_id
+    substitute_changed=payload.substitute_id!=old_substitute_id
+    details_changed=(group_name!=old_snapshot.class_group or classroom_name!=old_snapshot.classroom
+        or task_left!=absence.task_left or payload.observations!=absence.observations)
+    release_needed=old_substitute_id is not None and (substitute_changed or session_changed)
+    assign_needed=new_substitute is not None and (substitute_changed or session_changed)
+
+    try:
+        group=db.scalar(select(ClassGroup).where(ClassGroup.name==group_name))
+        if not group: group=ClassGroup(name=group_name); db.add(group); db.flush()
+        classroom=db.scalar(select(Classroom).where(Classroom.name==classroom_name))
+        if not classroom: classroom=Classroom(name=classroom_name); db.add(classroom); db.flush()
+
+        duplicate=db.scalar(select(Absence).where(
+            Absence.id!=absence.id, Absence.date==payload.date, Absence.timeslot_id==payload.timeslot_id,
+            Absence.absent_teacher_id==absence.absent_teacher_id, Absence.class_group_id==group.id,
+            Absence.classroom_id==classroom.id, Absence.task_left==task_left, Absence.observations==payload.observations,
+        ))
+        if duplicate: raise HTTPException(409,'Ya existe una sustitución idéntica registrada')
+
+        # The new substitute may already be covering a different absence in the new
+        # date/session; assigning them here too would silently double their commitment,
+        # so that older assignment is released first (and, best-effort, backfilled).
+        conflicting=None
+        if assign_needed:
+            conflicting=db.scalar(select(Absence).where(
+                Absence.date==payload.date, Absence.timeslot_id==payload.timeslot_id,
+                Absence.substitute_teacher_id==new_substitute.id, Absence.id!=absence.id,
+            ))
+            if conflicting:
+                release_substitute_credit(db,new_substitute.id,payload.timeslot_id)
+                conflicting.substitute_teacher_id=None
+                db.flush()
+                conflicting.substitute_teacher_id=assign_substitute(db,conflicting)
+                db.flush()
+
+        if release_needed: release_substitute_credit(db,old_substitute_id,old_timeslot_id)
+
+        absence.date=payload.date
+        absence.timeslot_id=payload.timeslot_id
+        absence.class_group_id=group.id
+        absence.classroom_id=classroom.id
+        absence.task_left=task_left
+        absence.observations=payload.observations
+        absence.substitute_teacher_id=new_substitute.id if new_substitute else None
+        db.flush()
+
+        # Unconditional: credit_manual_assignment() doesn't check GUARD/SUPPORT
+        # availability, which is exactly the bypass this endpoint requires.
+        if assign_needed: credit_manual_assignment(db,new_substitute.id,payload.timeslot_id)
+        db.flush()
+
+        # Corridor posts may need restaffing on both the old and the new session (they
+        # only differ when the date/session actually changed).
+        assign_hallway_duties(db,old_date,old_timeslot_id)
+        if session_changed: assign_hallway_duties(db,payload.date,payload.timeslot_id)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    db.refresh(absence)
+
+    # class_group/classroom are transient (not mapped columns); the notification
+    # helpers read them via getattr and fall back to 'no disponible' if unset.
+    absence.class_group=group.name
+    absence.classroom=classroom.name
+
+    if release_needed:
+        send_substitution_cancelled_email(db,old_snapshot,old_substitute_id)
+    if assign_needed:
+        send_substitution_email(db,absence,new_substitute.id)
+    elif new_substitute and not substitute_changed and not session_changed and details_changed:
+        send_absence_updated_email(db,absence,new_substitute.id)
+    if conflicting:
+        db.refresh(conflicting)
+        if conflicting.substitute_teacher_id is not None:
+            send_substitution_email(db,conflicting,conflicting.substitute_teacher_id)
+    return absence
 @app.get('/absences',response_model=list[AbsenceOut])
 def absences(request:Request,date_from:date|None=None,date_to:date|None=None,teacher_id:int|None=None,substitute_id:int|None=None,group_id:int|None=None,db:Session=Depends(get_db)):
     q=select(Absence).order_by(Absence.date.desc(),Absence.id.desc())
@@ -195,6 +440,10 @@ def sync_educamadrid(request:Request):
     if response.status_code!=200:
         raise HTTPException(502,f'El servicio de sincronización devolvió un error: {response.text}')
     return response.json()
+@app.get('/admin/email-logs',response_model=list[EmailLogOut])
+def email_logs(request:Request,db:Session=Depends(get_db)):
+    require_admin(request)
+    return db.scalars(select(EmailLog).order_by(EmailLog.sent_at.desc(),EmailLog.id.desc())).all()
 @app.post('/admin/reset-year')
 def reset_year(request:Request,db:Session=Depends(get_db)):
     """Clears operational data (substitutions and assignment statistics) to start a new

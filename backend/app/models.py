@@ -29,3 +29,9 @@ class HallwayDuty(Base):
     # weight stores the assigned teacher's duty_weight at assignment time, so the load
     # tally reflects the weight that applied then even if it's changed since.
     id: Mapped[int]=mapped_column(primary_key=True); date: Mapped[date]=mapped_column(Date); timeslot_id: Mapped[int]=mapped_column(ForeignKey('timeslots.id',ondelete='CASCADE')); post: Mapped[str]=mapped_column(String(20)); teacher_id: Mapped[int|None]=mapped_column(ForeignKey('teachers.id'),nullable=True); weight: Mapped[float]=mapped_column(Float,default=1.0,server_default='1')
+class EmailLog(Base):
+    # Audit trail of every notification email the platform attempted to send, since
+    # smtplib talks to the SMTP server directly and never leaves a copy in its own
+    # "Sent" folder. status is 'SUCCESS' or 'ERROR'; error_message is set only for the latter.
+    __tablename__='email_logs'
+    id: Mapped[int]=mapped_column(primary_key=True); recipient_email: Mapped[str]=mapped_column(String(255)); subject: Mapped[str]=mapped_column(String(255)); sent_at: Mapped[datetime]=mapped_column(DateTime,default=datetime.utcnow); status: Mapped[str]=mapped_column(String(10)); error_message: Mapped[str|None]=mapped_column(Text,nullable=True)

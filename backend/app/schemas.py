@@ -29,7 +29,36 @@ class AvailabilityIn(BaseModel):
     teacher_id: int
     entries: list[AvailabilityEntryIn]
 class AbsenceIn(BaseModel): date:date; timeslot_id:int; absent_teacher_id:int; class_group:str; classroom:str; task_left:str; observations:str|None=None
+class AbsenceManualAssignIn(BaseModel): substitute_id: int
+class AbsenceUpdateIn(BaseModel):
+    # A teacher may only correct what doesn't affect the automatic substitute
+    # assignment: the task description and the classroom. date/timeslot/class_group
+    # are intentionally absent here — changing those would require recalculating
+    # availability and the assigned substitute, so callers must delete and
+    # recreate the absence instead of editing them in place.
+    task_left: str | None = None
+    classroom: str | None = None
 class AbsenceOut(BaseModel): id:int; date:date; timeslot_id:int; absent_teacher_id:int; class_group_id:int; classroom_id:int; task_left:str; observations:str|None; substitute_teacher_id:int|None; created_at:datetime; model_config=ConfigDict(from_attributes=True)
+class AdminAbsenceUpdateIn(BaseModel):
+    # A full administrative replace: unlike AbsenceUpdateIn (the teacher's own
+    # task/classroom-only PATCH), every editable field is required here since this is
+    # a PUT — the admin UI always sends the complete, current state of the form.
+    # substitute_id is explicitly nullable: None unassigns and leaves the absence pending.
+    date: date
+    timeslot_id: int
+    class_group: str
+    classroom: str
+    task_left: str
+    observations: str | None = None
+    substitute_id: int | None = None
+class EmailLogOut(BaseModel):
+    id: int
+    recipient_email: str
+    subject: str
+    sent_at: datetime
+    status: str
+    error_message: str | None
+    model_config=ConfigDict(from_attributes=True)
 class LoginIn(BaseModel):
     # Administrator accounts may use internal addresses such as
     # ``admin@school.local``. Authentication compares this identifier with the

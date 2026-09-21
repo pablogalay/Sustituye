@@ -23,7 +23,7 @@ from sqlalchemy.pool import StaticPool
 from app.auth import hash_password
 from app.database import Base, get_db
 from app.main import app
-from app.models import Teacher, TimeSlot
+from app.models import Absence, AssignmentStatistic, Teacher, TimeSlot
 
 engine = create_engine('sqlite://', connect_args={'check_same_thread': False}, poolclass=StaticPool)
 TestingSessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
@@ -68,6 +68,7 @@ TIMESLOT_MONDAY = 1
 TIMESLOT_TUESDAY = 2
 TEACHER_ONE = 1
 TEACHER_TWO = 2
+TEACHER_INACTIVE = 3
 
 
 def admin_headers():
@@ -133,6 +134,9 @@ ADMIN_ONLY_REQUESTS = [
     ('delete', '/teachers/1', None),
     ('put', '/availability', {'teacher_id': 1, 'entries': []}),
     ('delete', '/absences/1', None),
+    ('patch', '/absences/1/force-assign', {'substitute_id': 1}),
+    ('put', '/absences/1', {'date': '2026-09-17', 'timeslot_id': 1, 'class_group': 'X', 'classroom': 'X', 'task_left': 'X', 'substitute_id': None}),
+    ('get', '/sessions/2026-09-17/1/teachers-status', None),
     ('post', '/admin/sync-educamadrid', None),
     ('post', '/admin/reset-year', None),
     ('get', '/reports/guard-duty.pdf', None),
@@ -459,3 +463,574 @@ def test_hallway_duties_are_visible_to_teachers():
 
 def test_saturday_has_no_corridor_duties():
     assert client.get('/hallway-duties', headers=admin_headers(), params={'day': '2026-09-12'}).json()['duties'] == []
+
+
+# --- manual assignment of pending absences (admin override) ------------------
+
+
+def _isolated_timeslot(period_number):
+    """A TimeSlot no teacher has ever been given availability for, so
+    assign_substitute() is guaranteed to leave a new absence on it unassigned."""
+    with TestingSessionLocal() as db:
+        slot = TimeSlot(weekday='Wednesday', period_number=period_number, start_time=time(8, 25), end_time=time(9, 20))
+        db.add(slot)
+        db.commit()
+        db.refresh(slot)
+        return slot.id
+
+
+def test_force_assign_credits_statistic_and_notifies(monkeypatch):
+    notified = {}
+    monkeypatch.setattr(
+        'app.main.send_substitution_email',
+        lambda db, absence, substitute_teacher_id: notified.update(
+            substitute_teacher_id=substitute_teacher_id, class_group=absence.class_group, classroom=absence.classroom,
+        ) or True,
+    )
+    timeslot_id = _isolated_timeslot(1)
+    substitute = client.post('/teachers', headers=admin_headers(), json={'first_name': 'Manual', 'last_name': 'Sub', 'email': 'manualsub@x.test', 'active': True, 'password': 'validpassword123'}).json()
+
+    pending = create_absence(admin_headers(), date='2026-09-09', absent_teacher_id=TEACHER_ONE, class_group='ManualG', classroom='ManualR', timeslot_id=timeslot_id).json()
+    assert pending['substitute_teacher_id'] is None
+
+    response = client.patch(f"/absences/{pending['id']}/force-assign", headers=admin_headers(), json={'substitute_id': substitute['id']})
+    assert response.status_code == 200
+    assert response.json()['substitute_teacher_id'] == substitute['id']
+
+    with TestingSessionLocal() as db:
+        stat = db.get(AssignmentStatistic, (substitute['id'], timeslot_id))
+        assert stat.assignment_count == substitute['duty_weight']
+
+    assert notified == {'substitute_teacher_id': substitute['id'], 'class_group': 'ManualG', 'classroom': 'ManualR'}
+
+
+def test_force_assign_bypasses_availability_for_a_teacher_with_no_guard_or_support():
+    """The whole point of force-assign: it must succeed and still credit the counter
+    even though this teacher has zero Availability rows for the session."""
+    timeslot_id = _isolated_timeslot(8)
+    substitute = client.post('/teachers', headers=admin_headers(), json={'first_name': 'NoDuty', 'last_name': 'Sub', 'email': 'noduty@x.test', 'active': True, 'password': 'validpassword123'}).json()
+    absence = create_absence(admin_headers(), date='2099-02-01', absent_teacher_id=TEACHER_ONE, class_group='BypassG', classroom='BypassR', timeslot_id=timeslot_id).json()
+
+    response = client.patch(f"/absences/{absence['id']}/force-assign", headers=admin_headers(), json={'substitute_id': substitute['id']})
+    assert response.status_code == 200
+    assert response.json()['substitute_teacher_id'] == substitute['id']
+    with TestingSessionLocal() as db:
+        stat = db.get(AssignmentStatistic, (substitute['id'], timeslot_id))
+        assert stat.assignment_count == substitute['duty_weight']
+
+
+def test_force_assign_returns_404_for_unknown_absence():
+    substitute = client.post('/teachers', headers=admin_headers(), json={'first_name': 'X404', 'last_name': 'Sub', 'email': 'x404sub@x.test', 'active': True, 'password': 'validpassword123'}).json()
+    response = client.patch('/absences/999999/force-assign', headers=admin_headers(), json={'substitute_id': substitute['id']})
+    assert response.status_code == 404
+
+
+def test_force_assign_returns_400_when_already_covered(monkeypatch):
+    monkeypatch.setattr('app.main.send_substitution_email', lambda db, absence, substitute_teacher_id: True)
+    timeslot_id = _isolated_timeslot(2)
+    substitute = client.post('/teachers', headers=admin_headers(), json={'first_name': 'Cov', 'last_name': 'Sub', 'email': 'covsub@x.test', 'active': True, 'password': 'validpassword123'}).json()
+    other = client.post('/teachers', headers=admin_headers(), json={'first_name': 'Cov2', 'last_name': 'Sub2', 'email': 'covsub2@x.test', 'active': True, 'password': 'validpassword123'}).json()
+    absence = create_absence(admin_headers(), date='2026-09-10', absent_teacher_id=TEACHER_ONE, class_group='CovG', classroom='CovR', timeslot_id=timeslot_id).json()
+
+    first = client.patch(f"/absences/{absence['id']}/force-assign", headers=admin_headers(), json={'substitute_id': substitute['id']})
+    assert first.status_code == 200
+    second = client.patch(f"/absences/{absence['id']}/force-assign", headers=admin_headers(), json={'substitute_id': other['id']})
+    assert second.status_code == 400
+
+
+def test_force_assign_returns_404_for_unknown_substitute():
+    timeslot_id = _isolated_timeslot(3)
+    absence = create_absence(admin_headers(), date='2026-09-11', absent_teacher_id=TEACHER_ONE, class_group='UnkG', classroom='UnkR', timeslot_id=timeslot_id).json()
+    response = client.patch(f"/absences/{absence['id']}/force-assign", headers=admin_headers(), json={'substitute_id': 999999})
+    assert response.status_code == 404
+
+
+def test_force_assign_returns_422_for_inactive_substitute():
+    timeslot_id = _isolated_timeslot(4)
+    absence = create_absence(admin_headers(), date='2026-09-12', absent_teacher_id=TEACHER_ONE, class_group='InactG', classroom='InactR', timeslot_id=timeslot_id).json()
+    response = client.patch(f"/absences/{absence['id']}/force-assign", headers=admin_headers(), json={'substitute_id': TEACHER_INACTIVE})
+    assert response.status_code == 422
+
+
+def test_force_assign_rejects_self_assignment():
+    timeslot_id = _isolated_timeslot(5)
+    absence = create_absence(admin_headers(), date='2026-09-13', absent_teacher_id=TEACHER_ONE, class_group='SelfG', classroom='SelfR', timeslot_id=timeslot_id).json()
+    response = client.patch(f"/absences/{absence['id']}/force-assign", headers=admin_headers(), json={'substitute_id': TEACHER_ONE})
+    assert response.status_code == 422
+
+
+def test_force_assign_rejects_a_substitute_who_is_also_absent_that_session():
+    timeslot_id = _isolated_timeslot(9)
+    absence_one = create_absence(admin_headers(), date='2099-02-02', absent_teacher_id=TEACHER_ONE, class_group='DoubleAbsG1', classroom='DoubleAbsR1', timeslot_id=timeslot_id).json()
+    absence_two = create_absence(admin_headers(), date='2099-02-02', absent_teacher_id=TEACHER_TWO, class_group='DoubleAbsG2', classroom='DoubleAbsR2', timeslot_id=timeslot_id).json()
+
+    response = client.patch(f"/absences/{absence_one['id']}/force-assign", headers=admin_headers(), json={'substitute_id': TEACHER_TWO})
+    assert response.status_code == 422
+    assert absence_two['absent_teacher_id'] == TEACHER_TWO
+
+
+def test_force_assign_releases_and_backfills_the_conflicting_absence(monkeypatch):
+    """The chosen substitute is already covering `other`; force-assigning them onto
+    `target` must free `other` (credit reversed) and let the automatic engine try to
+    refill it, notifying whoever ends up covering it."""
+    # SMTP is left unconfigured, so the real send_substitution_email() short-circuits to
+    # False without touching the network; wrapping it still proves it was *called* (and
+    # with which absence/substitute), which is what this test needs.
+    notified_absence_ids = []
+    import app.main as main_module
+    real_send_substitution_email = main_module.send_substitution_email
+
+    def spy(db, absence, substitute_teacher_id):
+        notified_absence_ids.append((absence.id, substitute_teacher_id))
+        return real_send_substitution_email(db, absence, substitute_teacher_id)
+
+    monkeypatch.setattr('app.main.send_substitution_email', spy)
+
+    timeslot_id = _isolated_timeslot(10)
+    shared_substitute = client.post('/teachers', headers=admin_headers(), json={'first_name': 'Shared', 'last_name': 'Sub', 'email': 'sharedsub@x.test', 'active': True, 'password': 'validpassword123'}).json()
+    # Give a third teacher GUARD availability for this slot, so assign_substitute() has
+    # somebody eligible to backfill `other` with once `shared_substitute` is pulled away.
+    backfill_candidate = client.post('/teachers', headers=admin_headers(), json={'first_name': 'Backfill', 'last_name': 'Sub', 'email': 'backfillsub@x.test', 'active': True, 'password': 'validpassword123'}).json()
+    client.put('/availability', headers=admin_headers(), json={'teacher_id': backfill_candidate['id'], 'entries': [{'timeslot_id': timeslot_id, 'duty_type': 'GUARD'}]})
+
+    other = create_absence(admin_headers(), date='2099-02-03', absent_teacher_id=TEACHER_ONE, class_group='ConflictOtherG', classroom='ConflictOtherR', timeslot_id=timeslot_id).json()
+    client.patch(f"/absences/{other['id']}/force-assign", headers=admin_headers(), json={'substitute_id': shared_substitute['id']})
+
+    target = create_absence(admin_headers(), date='2099-02-03', absent_teacher_id=TEACHER_TWO, class_group='ConflictTargetG', classroom='ConflictTargetR', timeslot_id=timeslot_id).json()
+    response = client.patch(f"/absences/{target['id']}/force-assign", headers=admin_headers(), json={'substitute_id': shared_substitute['id']})
+    assert response.status_code == 200
+    assert response.json()['substitute_teacher_id'] == shared_substitute['id']
+
+    refreshed_other = client.get('/absences', headers=admin_headers(), params={'teacher_id': TEACHER_ONE}).json()
+    refreshed_other = next(a for a in refreshed_other if a['id'] == other['id'])
+    assert refreshed_other['substitute_teacher_id'] == backfill_candidate['id']
+
+    with TestingSessionLocal() as db:
+        shared_stat = db.get(AssignmentStatistic, (shared_substitute['id'], timeslot_id))
+        # Credited once for `other` (released) and once for `target`: net +1 weight, not +2.
+        assert shared_stat.assignment_count == shared_substitute['duty_weight']
+        backfill_stat = db.get(AssignmentStatistic, (backfill_candidate['id'], timeslot_id))
+        assert backfill_stat.assignment_count == backfill_candidate['duty_weight']
+
+    assert (target['id'], shared_substitute['id']) in notified_absence_ids
+    assert (other['id'], backfill_candidate['id']) in notified_absence_ids
+
+
+# --- GET /sessions/{day}/{timeslot_id}/teachers-status ------------------------
+
+
+def test_teachers_status_returns_404_for_unknown_session():
+    response = client.get('/sessions/2026-09-17/999999/teachers-status', headers=admin_headers())
+    assert response.status_code == 404
+
+
+def test_teachers_status_reports_guard_support_busy_absent_and_unavailable():
+    timeslot_id = _isolated_timeslot(11)
+    guard = client.post('/teachers', headers=admin_headers(), json={'first_name': 'Status', 'last_name': 'Guard', 'email': 'statusguard@x.test', 'active': True, 'password': 'validpassword123'}).json()
+    support = client.post('/teachers', headers=admin_headers(), json={'first_name': 'Status', 'last_name': 'Support', 'email': 'statussupport@x.test', 'active': True, 'password': 'validpassword123'}).json()
+    free = client.post('/teachers', headers=admin_headers(), json={'first_name': 'Status', 'last_name': 'Free', 'email': 'statusfree@x.test', 'active': True, 'password': 'validpassword123'}).json()
+    busy_sub = client.post('/teachers', headers=admin_headers(), json={'first_name': 'Status', 'last_name': 'Busy', 'email': 'statusbusy@x.test', 'active': True, 'password': 'validpassword123'}).json()
+    absent_teacher = client.post('/teachers', headers=admin_headers(), json={'first_name': 'Status', 'last_name': 'Absent', 'email': 'statusabsent@x.test', 'active': True, 'password': 'validpassword123'}).json()
+
+    # Created before anyone has availability on this isolated timeslot, so the automatic
+    # engine leaves it pending and `busy_sub` can be force-assigned deterministically.
+    covered = create_absence(admin_headers(), date='2099-02-04', absent_teacher_id=TEACHER_ONE, class_group='StatusCoveredG', classroom='StatusCoveredR', timeslot_id=timeslot_id).json()
+    assign_response = client.patch(f"/absences/{covered['id']}/force-assign", headers=admin_headers(), json={'substitute_id': busy_sub['id']})
+    assert assign_response.status_code == 200
+    create_absence(admin_headers(), date='2099-02-04', absent_teacher_id=absent_teacher['id'], class_group='StatusAbsentG', classroom='StatusAbsentR', timeslot_id=timeslot_id)
+
+    client.put('/availability', headers=admin_headers(), json={'teacher_id': guard['id'], 'entries': [{'timeslot_id': timeslot_id, 'duty_type': 'GUARD'}]})
+    client.put('/availability', headers=admin_headers(), json={'teacher_id': support['id'], 'entries': [{'timeslot_id': timeslot_id, 'duty_type': 'SUPPORT'}]})
+
+    statuses = {row['id']: row['status'] for row in client.get(f"/sessions/2099-02-04/{timeslot_id}/teachers-status", headers=admin_headers()).json()}
+    assert statuses[guard['id']] == 'GUARD'
+    assert statuses[support['id']] == 'SUPPORT'
+    assert statuses[free['id']] == 'UNAVAILABLE'
+    assert statuses[busy_sub['id']] == 'BUSY'
+    assert statuses[absent_teacher['id']] == 'ABSENT'
+
+
+# --- PATCH /absences/{id}: teacher self-edit of task/classroom ----------------
+
+
+def test_teacher_can_update_task_and_classroom_of_their_own_future_absence():
+    absence = create_absence(teacher_headers(), date='2099-01-05', absent_teacher_id=TEACHER_ONE, class_group='EditG', classroom='OldRoom', task_left='Old task').json()
+    response = client.patch(f"/absences/{absence['id']}", headers=teacher_headers(), json={'task_left': 'New task', 'classroom': 'NewRoom'})
+    assert response.status_code == 200
+    body = response.json()
+    assert body['task_left'] == 'New task'
+    classrooms = {c['name']: c['id'] for c in client.get('/classrooms', headers=admin_headers()).json()}
+    assert body['classroom_id'] == classrooms['NewRoom']
+
+
+def test_teacher_can_update_only_one_field_at_a_time():
+    absence = create_absence(teacher_headers(), date='2099-01-06', absent_teacher_id=TEACHER_ONE, class_group='EditG2', classroom='KeepRoom', task_left='Keep task').json()
+    response = client.patch(f"/absences/{absence['id']}", headers=teacher_headers(), json={'task_left': 'Only task changed'})
+    assert response.status_code == 200
+    body = response.json()
+    assert body['task_left'] == 'Only task changed'
+    assert body['classroom_id'] == absence['classroom_id']
+
+
+def test_update_absence_does_not_accept_date_timeslot_or_group_fields():
+    """The schema simply has no fields for them, so attempting to send them is a no-op
+    rather than a 422 - FastAPI/Pydantic silently ignores unknown extra fields."""
+    absence = create_absence(teacher_headers(), date='2099-01-07', absent_teacher_id=TEACHER_ONE, class_group='EditG3', classroom='SameRoom', task_left='Same task').json()
+    response = client.patch(f"/absences/{absence['id']}", headers=teacher_headers(), json={'task_left': 'Changed task', 'date': '2099-02-02', 'timeslot_id': TIMESLOT_TUESDAY, 'class_group': 'HackedGroup'})
+    assert response.status_code == 200
+    body = response.json()
+    assert body['date'] == '2099-01-07'
+    assert body['timeslot_id'] == absence['timeslot_id']
+    assert body['class_group_id'] == absence['class_group_id']
+
+
+def test_teacher_cannot_update_someone_elses_absence():
+    absence = create_absence(admin_headers(), date='2099-01-08', absent_teacher_id=TEACHER_TWO, class_group='OtherG', classroom='OtherRoom', task_left='Other task').json()
+    response = client.patch(f"/absences/{absence['id']}", headers=teacher_headers(), json={'task_left': 'Hijacked'})
+    assert response.status_code == 403
+
+
+def test_admin_can_update_any_absence():
+    absence = create_absence(admin_headers(), date='2099-01-09', absent_teacher_id=TEACHER_TWO, class_group='AdminG', classroom='AdminRoom', task_left='Admin task').json()
+    response = client.patch(f"/absences/{absence['id']}", headers=admin_headers(), json={'task_left': 'Fixed by admin'})
+    assert response.status_code == 200
+    assert response.json()['task_left'] == 'Fixed by admin'
+
+
+def test_update_absence_rejects_a_date_already_in_the_past():
+    absence = create_absence(admin_headers(), date='2020-01-01', absent_teacher_id=TEACHER_ONE, class_group='PastG', classroom='PastRoom', task_left='Past task').json()
+    response = client.patch(f"/absences/{absence['id']}", headers=teacher_headers(), json={'task_left': 'Too late'})
+    assert response.status_code == 409
+
+
+def test_update_absence_returns_404_for_unknown_absence():
+    response = client.patch('/absences/999999', headers=admin_headers(), json={'task_left': 'X'})
+    assert response.status_code == 404
+
+
+def test_update_absence_requires_at_least_one_field():
+    absence = create_absence(teacher_headers(), date='2099-01-10', absent_teacher_id=TEACHER_ONE, class_group='EmptyG', classroom='EmptyRoom', task_left='Task').json()
+    response = client.patch(f"/absences/{absence['id']}", headers=teacher_headers(), json={})
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize('date, field, bad_value', [('2099-01-11', 'task_left', '   '), ('2099-01-14', 'classroom', '')])
+def test_update_absence_rejects_blank_values(date, field, bad_value):
+    absence = create_absence(teacher_headers(), date=date, absent_teacher_id=TEACHER_ONE, class_group='BlankG', classroom='BlankRoom', task_left='Task').json()
+    response = client.patch(f"/absences/{absence['id']}", headers=teacher_headers(), json={field: bad_value})
+    assert response.status_code == 422
+
+
+def test_update_absence_notifies_the_already_assigned_substitute(monkeypatch):
+    notified = {}
+    monkeypatch.setattr(
+        'app.main.send_absence_updated_email',
+        lambda db, absence, substitute_teacher_id: notified.update(
+            substitute_teacher_id=substitute_teacher_id, task_left=absence.task_left, classroom=absence.classroom,
+        ) or True,
+    )
+    timeslot_id = _isolated_timeslot(6)
+    substitute = client.post('/teachers', headers=admin_headers(), json={'first_name': 'Notif', 'last_name': 'Sub', 'email': 'notifsub@x.test', 'active': True, 'password': 'validpassword123'}).json()
+    absence = create_absence(admin_headers(), date='2099-01-12', absent_teacher_id=TEACHER_ONE, class_group='NotifG', classroom='OldRoom', task_left='Old', timeslot_id=timeslot_id).json()
+    client.patch(f"/absences/{absence['id']}/force-assign", headers=admin_headers(), json={'substitute_id': substitute['id']})
+
+    response = client.patch(f"/absences/{absence['id']}", headers=admin_headers(), json={'task_left': 'Updated task', 'classroom': 'NewRoom'})
+    assert response.status_code == 200
+    assert notified == {'substitute_teacher_id': substitute['id'], 'task_left': 'Updated task', 'classroom': 'NewRoom'}
+
+
+def test_update_absence_does_not_notify_when_no_substitute_is_assigned(monkeypatch):
+    called = []
+    monkeypatch.setattr('app.main.send_absence_updated_email', lambda db, absence, substitute_teacher_id: called.append(1) or True)
+    timeslot_id = _isolated_timeslot(7)
+    absence = create_absence(teacher_headers(), date='2099-01-13', absent_teacher_id=TEACHER_ONE, class_group='NoSubG', classroom='NoSubRoom', task_left='Task', timeslot_id=timeslot_id).json()
+    assert absence['substitute_teacher_id'] is None
+
+    response = client.patch(f"/absences/{absence['id']}", headers=teacher_headers(), json={'task_left': 'Updated without substitute'})
+    assert response.status_code == 200
+    assert called == []
+
+
+# --- PUT /absences/{id}: full administrative edit ("el baile de contadores") --
+
+
+def _put_body(**overrides):
+    body = dict(date='2099-03-01', timeslot_id=TIMESLOT_MONDAY, class_group='X', classroom='X', task_left='X', observations=None, substitute_id=None)
+    body.update(overrides)
+    return body
+
+
+def test_admin_put_changing_only_details_sends_the_details_updated_email(monkeypatch):
+    timeslot_id = _isolated_timeslot(12)
+    substitute = client.post('/teachers', headers=admin_headers(), json={'first_name': 'PutDetails', 'last_name': 'Sub', 'email': 'putdetailssub@x.test', 'active': True, 'password': 'validpassword123'}).json()
+    absence = create_absence(admin_headers(), date='2099-03-07', absent_teacher_id=TEACHER_ONE, class_group='PutDetailsG', classroom='OldRoom', task_left='Old task', timeslot_id=timeslot_id).json()
+    client.patch(f"/absences/{absence['id']}/force-assign", headers=admin_headers(), json={'substitute_id': substitute['id']})
+
+    # Patched only after the setup calls above, so force-assign's own (real) notification
+    # doesn't get counted as one of the PUT's notifications.
+    notified = []
+    monkeypatch.setattr('app.main.send_absence_updated_email', lambda db, absence, substitute_teacher_id: notified.append((substitute_teacher_id, absence.task_left, absence.classroom)) or True)
+    assign_spy = []
+    monkeypatch.setattr('app.main.send_substitution_email', lambda db, absence, substitute_teacher_id: assign_spy.append(substitute_teacher_id) or True)
+
+    response = client.put(f"/absences/{absence['id']}", headers=admin_headers(), json=_put_body(
+        date='2099-03-07', timeslot_id=timeslot_id, class_group='PutDetailsG', classroom='NewRoom', task_left='New task', substitute_id=substitute['id'],
+    ))
+    assert response.status_code == 200
+    assert response.json()['task_left'] == 'New task'
+    assert notified == [(substitute['id'], 'New task', 'NewRoom')]
+    assert assign_spy == []
+
+
+def test_admin_put_changing_substitute_releases_old_and_credits_new(monkeypatch):
+    notified = []
+    monkeypatch.setattr('app.main.send_substitution_cancelled_email', lambda db, absence, substitute_teacher_id: notified.append(('cancel', substitute_teacher_id)) or True)
+    monkeypatch.setattr('app.main.send_substitution_email', lambda db, absence, substitute_teacher_id: notified.append(('assign', substitute_teacher_id)) or True)
+
+    timeslot_id = _isolated_timeslot(13)
+    teacher_a = client.post('/teachers', headers=admin_headers(), json={'first_name': 'PutA', 'last_name': 'Sub', 'email': 'putasub@x.test', 'active': True, 'password': 'validpassword123'}).json()
+    teacher_b = client.post('/teachers', headers=admin_headers(), json={'first_name': 'PutB', 'last_name': 'Sub', 'email': 'putbsub@x.test', 'active': True, 'password': 'validpassword123'}).json()
+    absence = create_absence(admin_headers(), date='2099-03-01', absent_teacher_id=TEACHER_ONE, class_group='PutSwapG', classroom='PutSwapR', timeslot_id=timeslot_id).json()
+    client.patch(f"/absences/{absence['id']}/force-assign", headers=admin_headers(), json={'substitute_id': teacher_a['id']})
+
+    response = client.put(f"/absences/{absence['id']}", headers=admin_headers(), json=_put_body(
+        date='2099-03-01', timeslot_id=timeslot_id, class_group='PutSwapG', classroom='PutSwapR', task_left='Trabajo', substitute_id=teacher_b['id'],
+    ))
+    assert response.status_code == 200
+    assert response.json()['substitute_teacher_id'] == teacher_b['id']
+
+    with TestingSessionLocal() as db:
+        assert db.get(AssignmentStatistic, (teacher_a['id'], timeslot_id)).assignment_count == 0
+        assert db.get(AssignmentStatistic, (teacher_b['id'], timeslot_id)).assignment_count == teacher_b['duty_weight']
+
+    assert ('cancel', teacher_a['id']) in notified
+    assert ('assign', teacher_b['id']) in notified
+
+
+def test_admin_put_changing_session_with_same_substitute_moves_the_counter(monkeypatch):
+    notified = []
+    monkeypatch.setattr('app.main.send_substitution_cancelled_email', lambda db, absence, substitute_teacher_id: notified.append(('cancel', substitute_teacher_id)) or True)
+    monkeypatch.setattr('app.main.send_substitution_email', lambda db, absence, substitute_teacher_id: notified.append(('assign', substitute_teacher_id)) or True)
+
+    old_timeslot_id = _isolated_timeslot(14)
+    new_timeslot_id = _isolated_timeslot(15)
+    substitute = client.post('/teachers', headers=admin_headers(), json={'first_name': 'PutMove', 'last_name': 'Sub', 'email': 'putmovesub@x.test', 'active': True, 'password': 'validpassword123'}).json()
+    absence = create_absence(admin_headers(), date='2099-03-02', absent_teacher_id=TEACHER_ONE, class_group='PutMoveG', classroom='PutMoveR', timeslot_id=old_timeslot_id).json()
+    client.patch(f"/absences/{absence['id']}/force-assign", headers=admin_headers(), json={'substitute_id': substitute['id']})
+
+    response = client.put(f"/absences/{absence['id']}", headers=admin_headers(), json=_put_body(
+        date='2099-03-03', timeslot_id=new_timeslot_id, class_group='PutMoveG', classroom='PutMoveR', task_left='Trabajo', substitute_id=substitute['id'],
+    ))
+    assert response.status_code == 200
+
+    with TestingSessionLocal() as db:
+        assert db.get(AssignmentStatistic, (substitute['id'], old_timeslot_id)).assignment_count == 0
+        assert db.get(AssignmentStatistic, (substitute['id'], new_timeslot_id)).assignment_count == substitute['duty_weight']
+
+    assert ('cancel', substitute['id']) in notified
+    assert ('assign', substitute['id']) in notified
+
+
+def test_admin_put_unassigning_substitute_releases_credit_and_notifies_cancellation(monkeypatch):
+    timeslot_id = _isolated_timeslot(16)
+    substitute = client.post('/teachers', headers=admin_headers(), json={'first_name': 'PutUnassign', 'last_name': 'Sub', 'email': 'putunassignsub@x.test', 'active': True, 'password': 'validpassword123'}).json()
+    absence = create_absence(admin_headers(), date='2099-03-04', absent_teacher_id=TEACHER_ONE, class_group='PutUnassignG', classroom='PutUnassignR', timeslot_id=timeslot_id).json()
+    client.patch(f"/absences/{absence['id']}/force-assign", headers=admin_headers(), json={'substitute_id': substitute['id']})
+
+    cancel_spy = []
+    monkeypatch.setattr('app.main.send_substitution_cancelled_email', lambda db, absence, substitute_teacher_id: cancel_spy.append(substitute_teacher_id) or True)
+    assign_spy = []
+    monkeypatch.setattr('app.main.send_substitution_email', lambda db, absence, substitute_teacher_id: assign_spy.append(substitute_teacher_id) or True)
+
+    response = client.put(f"/absences/{absence['id']}", headers=admin_headers(), json=_put_body(
+        date='2099-03-04', timeslot_id=timeslot_id, class_group='PutUnassignG', classroom='PutUnassignR', task_left='Trabajo', substitute_id=None,
+    ))
+    assert response.status_code == 200
+    assert response.json()['substitute_teacher_id'] is None
+
+    with TestingSessionLocal() as db:
+        assert db.get(AssignmentStatistic, (substitute['id'], timeslot_id)).assignment_count == 0
+
+    assert cancel_spy == [substitute['id']]
+    assert assign_spy == []
+
+
+def test_admin_put_can_assign_a_substitute_to_a_previously_pending_absence(monkeypatch):
+    assign_spy = []
+    monkeypatch.setattr('app.main.send_substitution_email', lambda db, absence, substitute_teacher_id: assign_spy.append(substitute_teacher_id) or True)
+    cancel_spy = []
+    monkeypatch.setattr('app.main.send_substitution_cancelled_email', lambda db, absence, substitute_teacher_id: cancel_spy.append(substitute_teacher_id) or True)
+
+    timeslot_id = _isolated_timeslot(17)
+    substitute = client.post('/teachers', headers=admin_headers(), json={'first_name': 'PutFill', 'last_name': 'Sub', 'email': 'putfillsub@x.test', 'active': True, 'password': 'validpassword123'}).json()
+    absence = create_absence(admin_headers(), date='2099-03-05', absent_teacher_id=TEACHER_ONE, class_group='PutFillG', classroom='PutFillR', timeslot_id=timeslot_id).json()
+    assert absence['substitute_teacher_id'] is None
+
+    response = client.put(f"/absences/{absence['id']}", headers=admin_headers(), json=_put_body(
+        date='2099-03-05', timeslot_id=timeslot_id, class_group='PutFillG', classroom='PutFillR', task_left='Trabajo', substitute_id=substitute['id'],
+    ))
+    assert response.status_code == 200
+    assert response.json()['substitute_teacher_id'] == substitute['id']
+
+    with TestingSessionLocal() as db:
+        assert db.get(AssignmentStatistic, (substitute['id'], timeslot_id)).assignment_count == substitute['duty_weight']
+
+    assert assign_spy == [substitute['id']]
+    assert cancel_spy == []
+
+
+def test_admin_put_no_op_save_sends_no_emails_and_leaves_counters_unchanged(monkeypatch):
+    timeslot_id = _isolated_timeslot(18)
+    substitute = client.post('/teachers', headers=admin_headers(), json={'first_name': 'PutNoop', 'last_name': 'Sub', 'email': 'putnoopsub@x.test', 'active': True, 'password': 'validpassword123'}).json()
+    absence = create_absence(admin_headers(), date='2099-03-06', absent_teacher_id=TEACHER_ONE, class_group='PutNoopG', classroom='PutNoopR', task_left='Trabajo', timeslot_id=timeslot_id).json()
+    client.patch(f"/absences/{absence['id']}/force-assign", headers=admin_headers(), json={'substitute_id': substitute['id']})
+
+    with TestingSessionLocal() as db:
+        before = db.get(AssignmentStatistic, (substitute['id'], timeslot_id)).assignment_count
+
+    notified = []
+    monkeypatch.setattr('app.main.send_substitution_email', lambda db, absence, substitute_teacher_id: notified.append(('assign', substitute_teacher_id)) or True)
+    monkeypatch.setattr('app.main.send_substitution_cancelled_email', lambda db, absence, substitute_teacher_id: notified.append(('cancel', substitute_teacher_id)) or True)
+    monkeypatch.setattr('app.main.send_absence_updated_email', lambda db, absence, substitute_teacher_id: notified.append(('update', substitute_teacher_id)) or True)
+
+    response = client.put(f"/absences/{absence['id']}", headers=admin_headers(), json=_put_body(
+        date='2099-03-06', timeslot_id=timeslot_id, class_group='PutNoopG', classroom='PutNoopR', task_left='Trabajo', substitute_id=substitute['id'],
+    ))
+    assert response.status_code == 200
+
+    with TestingSessionLocal() as db:
+        assert db.get(AssignmentStatistic, (substitute['id'], timeslot_id)).assignment_count == before
+    assert notified == []
+
+
+def test_admin_put_releases_and_backfills_a_conflicting_absence(monkeypatch):
+    notified_absence_ids = []
+    import app.main as main_module
+    real_send_substitution_email = main_module.send_substitution_email
+
+    def spy(db, absence, substitute_teacher_id):
+        notified_absence_ids.append((absence.id, substitute_teacher_id))
+        return real_send_substitution_email(db, absence, substitute_teacher_id)
+
+    monkeypatch.setattr('app.main.send_substitution_email', spy)
+
+    timeslot_id = _isolated_timeslot(19)
+    shared_substitute = client.post('/teachers', headers=admin_headers(), json={'first_name': 'PutShared', 'last_name': 'Sub', 'email': 'putsharedsub@x.test', 'active': True, 'password': 'validpassword123'}).json()
+    backfill_candidate = client.post('/teachers', headers=admin_headers(), json={'first_name': 'PutBackfill', 'last_name': 'Sub', 'email': 'putbackfillsub@x.test', 'active': True, 'password': 'validpassword123'}).json()
+
+    # Created before anyone has availability on this isolated timeslot, so both stay
+    # pending from the automatic engine's point of view until explicitly assigned below.
+    other = create_absence(admin_headers(), date='2099-03-08', absent_teacher_id=TEACHER_ONE, class_group='PutConflictOtherG', classroom='PutConflictOtherR', timeslot_id=timeslot_id).json()
+    client.patch(f"/absences/{other['id']}/force-assign", headers=admin_headers(), json={'substitute_id': shared_substitute['id']})
+    target = create_absence(admin_headers(), date='2099-03-09', absent_teacher_id=TEACHER_TWO, class_group='PutConflictTargetG', classroom='PutConflictTargetR', timeslot_id=timeslot_id).json()
+    assert target['substitute_teacher_id'] is None
+
+    # Only now does backfill_candidate become eligible, so assign_substitute() has
+    # somebody to backfill `other` with once shared_substitute is pulled away from it.
+    client.put('/availability', headers=admin_headers(), json={'teacher_id': backfill_candidate['id'], 'entries': [{'timeslot_id': timeslot_id, 'duty_type': 'GUARD'}]})
+
+    response = client.put(f"/absences/{target['id']}", headers=admin_headers(), json=_put_body(
+        date='2099-03-08', timeslot_id=timeslot_id, class_group='PutConflictTargetG', classroom='PutConflictTargetR', task_left='Trabajo', substitute_id=shared_substitute['id'],
+    ))
+    assert response.status_code == 200
+    assert response.json()['substitute_teacher_id'] == shared_substitute['id']
+
+    refreshed_other = next(a for a in client.get('/absences', headers=admin_headers(), params={'teacher_id': TEACHER_ONE}).json() if a['id'] == other['id'])
+    assert refreshed_other['substitute_teacher_id'] == backfill_candidate['id']
+
+    with TestingSessionLocal() as db:
+        assert db.get(AssignmentStatistic, (shared_substitute['id'], timeslot_id)).assignment_count == shared_substitute['duty_weight']
+        assert db.get(AssignmentStatistic, (backfill_candidate['id'], timeslot_id)).assignment_count == backfill_candidate['duty_weight']
+
+    assert (target['id'], shared_substitute['id']) in notified_absence_ids
+    assert (other['id'], backfill_candidate['id']) in notified_absence_ids
+
+
+def test_admin_put_returns_404_for_unknown_absence():
+    response = client.put('/absences/999999', headers=admin_headers(), json=_put_body(timeslot_id=TIMESLOT_MONDAY))
+    assert response.status_code == 404
+
+
+def test_admin_put_returns_404_for_unknown_session():
+    timeslot_id = _isolated_timeslot(20)
+    absence = create_absence(admin_headers(), date='2099-03-11', absent_teacher_id=TEACHER_ONE, class_group='PutBadSessG', classroom='PutBadSessR', timeslot_id=timeslot_id).json()
+    response = client.put(f"/absences/{absence['id']}", headers=admin_headers(), json=_put_body(date='2099-03-11', timeslot_id=999999, class_group='PutBadSessG', classroom='PutBadSessR', task_left='Trabajo'))
+    assert response.status_code == 404
+
+
+def test_admin_put_returns_404_for_unknown_substitute():
+    timeslot_id = _isolated_timeslot(21)
+    absence = create_absence(admin_headers(), date='2099-03-12', absent_teacher_id=TEACHER_ONE, class_group='PutBadSubG', classroom='PutBadSubR', timeslot_id=timeslot_id).json()
+    response = client.put(f"/absences/{absence['id']}", headers=admin_headers(), json=_put_body(date='2099-03-12', timeslot_id=timeslot_id, class_group='PutBadSubG', classroom='PutBadSubR', task_left='Trabajo', substitute_id=999999))
+    assert response.status_code == 404
+
+
+def test_admin_put_returns_422_for_inactive_substitute():
+    timeslot_id = _isolated_timeslot(22)
+    absence = create_absence(admin_headers(), date='2099-03-13', absent_teacher_id=TEACHER_ONE, class_group='PutInactG', classroom='PutInactR', timeslot_id=timeslot_id).json()
+    response = client.put(f"/absences/{absence['id']}", headers=admin_headers(), json=_put_body(date='2099-03-13', timeslot_id=timeslot_id, class_group='PutInactG', classroom='PutInactR', task_left='Trabajo', substitute_id=TEACHER_INACTIVE))
+    assert response.status_code == 422
+
+
+def test_admin_put_rejects_self_assignment():
+    timeslot_id = _isolated_timeslot(23)
+    absence = create_absence(admin_headers(), date='2099-03-14', absent_teacher_id=TEACHER_ONE, class_group='PutSelfG', classroom='PutSelfR', timeslot_id=timeslot_id).json()
+    response = client.put(f"/absences/{absence['id']}", headers=admin_headers(), json=_put_body(date='2099-03-14', timeslot_id=timeslot_id, class_group='PutSelfG', classroom='PutSelfR', task_left='Trabajo', substitute_id=TEACHER_ONE))
+    assert response.status_code == 422
+
+
+def test_admin_put_rejects_a_substitute_who_is_also_absent_at_the_new_session():
+    timeslot_id = _isolated_timeslot(24)
+    absence_one = create_absence(admin_headers(), date='2099-03-15', absent_teacher_id=TEACHER_ONE, class_group='PutDoubleAbsG1', classroom='PutDoubleAbsR1', timeslot_id=timeslot_id).json()
+    create_absence(admin_headers(), date='2099-03-15', absent_teacher_id=TEACHER_TWO, class_group='PutDoubleAbsG2', classroom='PutDoubleAbsR2', timeslot_id=timeslot_id)
+
+    response = client.put(f"/absences/{absence_one['id']}", headers=admin_headers(), json=_put_body(date='2099-03-15', timeslot_id=timeslot_id, class_group='PutDoubleAbsG1', classroom='PutDoubleAbsR1', task_left='Trabajo', substitute_id=TEACHER_TWO))
+    assert response.status_code == 422
+
+
+def test_admin_put_rejects_a_duplicate_of_another_absence():
+    timeslot_id = _isolated_timeslot(25)
+    create_absence(admin_headers(), date='2099-03-16', absent_teacher_id=TEACHER_ONE, class_group='PutDupG', classroom='PutDupR', task_left='Same task', timeslot_id=timeslot_id)
+    movable = create_absence(admin_headers(), date='2099-03-17', absent_teacher_id=TEACHER_ONE, class_group='PutDupG', classroom='PutDupR', task_left='Same task', timeslot_id=timeslot_id).json()
+
+    response = client.put(f"/absences/{movable['id']}", headers=admin_headers(), json=_put_body(date='2099-03-16', timeslot_id=timeslot_id, class_group='PutDupG', classroom='PutDupR', task_left='Same task'))
+    assert response.status_code == 409
+
+
+def test_admin_put_allows_editing_an_absence_with_a_past_date(monkeypatch):
+    monkeypatch.setattr('app.main.send_absence_updated_email', lambda db, absence, substitute_teacher_id: True)
+    timeslot_id = _isolated_timeslot(26)
+    absence = create_absence(admin_headers(), date='2020-01-01', absent_teacher_id=TEACHER_ONE, class_group='PutPastG', classroom='OldPastRoom', task_left='Old', timeslot_id=timeslot_id).json()
+
+    response = client.put(f"/absences/{absence['id']}", headers=admin_headers(), json=_put_body(date='2020-01-01', timeslot_id=timeslot_id, class_group='PutPastG', classroom='NewPastRoom', task_left='Corrected'))
+    assert response.status_code == 200
+    assert response.json()['task_left'] == 'Corrected'
+
+
+def test_admin_put_rolls_back_everything_if_a_later_step_fails(monkeypatch):
+    timeslot_id = _isolated_timeslot(27)
+    substitute = client.post('/teachers', headers=admin_headers(), json={'first_name': 'PutRollback', 'last_name': 'Sub', 'email': 'putrollbacksub@x.test', 'active': True, 'password': 'validpassword123'}).json()
+    new_substitute = client.post('/teachers', headers=admin_headers(), json={'first_name': 'PutRollback2', 'last_name': 'Sub2', 'email': 'putrollbacksub2@x.test', 'active': True, 'password': 'validpassword123'}).json()
+    absence = create_absence(admin_headers(), date='2099-03-18', absent_teacher_id=TEACHER_ONE, class_group='PutRollbackG', classroom='OldRoom', task_left='Old', timeslot_id=timeslot_id).json()
+    client.patch(f"/absences/{absence['id']}/force-assign", headers=admin_headers(), json={'substitute_id': substitute['id']})
+
+    with TestingSessionLocal() as db:
+        before_task = db.get(Absence, absence['id']).task_left
+        before_old_stat = db.get(AssignmentStatistic, (substitute['id'], timeslot_id)).assignment_count
+
+    def boom(db, day, timeslot_id):
+        raise RuntimeError('simulated failure')
+    monkeypatch.setattr('app.main.assign_hallway_duties', boom)
+
+    with pytest.raises(RuntimeError):
+        client.put(f"/absences/{absence['id']}", headers=admin_headers(), json=_put_body(
+            date='2099-03-18', timeslot_id=timeslot_id, class_group='PutRollbackG', classroom='NewRoom', task_left='New', substitute_id=new_substitute['id'],
+        ))
+
+    with TestingSessionLocal() as db:
+        after = db.get(Absence, absence['id'])
+        assert after.task_left == before_task
+        assert after.substitute_teacher_id == substitute['id']
+        assert db.get(AssignmentStatistic, (substitute['id'], timeslot_id)).assignment_count == before_old_stat
+        new_stat = db.get(AssignmentStatistic, (new_substitute['id'], timeslot_id))
+        assert new_stat is None or new_stat.assignment_count == 0

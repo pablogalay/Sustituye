@@ -6,7 +6,7 @@ from email.message import EmailMessage
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
-from .models import Absence, AssignmentStatistic, Availability, HallwayDuty, Teacher, TimeSlot
+from .models import Absence, AssignmentStatistic, Availability, EmailLog, HallwayDuty, Teacher, TimeSlot
 
 logger = logging.getLogger(__name__)
 def assign_substitute(db:Session, absence:Absence) -> int|None:
@@ -45,6 +45,17 @@ def release_substitute_credit(db:Session, teacher_id:int, timeslot_id:int) -> No
     teacher=db.get(Teacher,teacher_id)
     weight=teacher.duty_weight if teacher else 1.0
     stat.assignment_count=max(0.0,stat.assignment_count-weight)
+
+def credit_manual_assignment(db:Session, teacher_id:int, timeslot_id:int) -> None:
+    """Credits a teacher's weighted assignment counter for a session an administrator
+    force-assigned them to by hand, exactly like assign_substitute() credits an automatic
+    pick, so a manual override still counts toward the fair-rotation bookkeeping.
+    Row-locked the same way assign_substitute() locks its candidates, to stay safe if a
+    concurrent request touches the same counter."""
+    teacher=db.get(Teacher,teacher_id,with_for_update=True)
+    stat=db.get(AssignmentStatistic,(teacher_id,timeslot_id),with_for_update=True)
+    if stat: stat.assignment_count+=teacher.duty_weight
+    else: db.add(AssignmentStatistic(teacher_id=teacher_id,timeslot_id=timeslot_id,assignment_count=teacher.duty_weight))
 
 # Corridor posts that must be staffed in every session, in the order they are filled
 # once the substitutions of that session are already covered.
@@ -116,7 +127,13 @@ def ensure_hallway_duties_for_date(db:Session, day) -> list[HallwayDuty]:
     return [duty for slot in slots for duty in assign_hallway_duties(db,day,slot.id)]
 
 
-def send_substitution_email(db:Session, absence:Absence, substitute_teacher_id:int) -> bool:
+def _deliver_email(db:Session, message:EmailMessage, log_context:str) -> bool:
+    """Shared SMTP delivery used by every notification email; the caller only builds
+    the message (Subject/To/body) and describes itself for the log lines.
+
+    Every real delivery attempt (SMTP configured, so a send was actually tried) is
+    recorded in EmailLog for audit purposes, since smtplib talks to the SMTP server
+    directly and never leaves a copy of what it sent in that mailbox's own "Sent" folder."""
     host=os.getenv('SMTP_HOST','').strip()
     port=int(os.getenv('SMTP_PORT','587'))
     username=os.getenv('SMTP_USERNAME','').strip()
@@ -125,9 +142,41 @@ def send_substitution_email(db:Session, absence:Absence, substitute_teacher_id:i
     use_tls=os.getenv('SMTP_USE_TLS','true').lower() not in {'0','false','no'}
     use_ssl=os.getenv('SMTP_USE_SSL','false').lower() in {'1','true','yes'}
     if not host or not sender:
-        logger.info('SMTP not configured; skipping substitution email for teacher_id=%s', substitute_teacher_id)
+        logger.info('SMTP not configured; skipping email for %s', log_context)
+        return False
+    message['From']=sender
+    recipient=message['To'] or ''
+    subject=message['Subject'] or ''
+    # Quick-fix backup: BCC a copy to the sending mailbox itself, so a physical copy of
+    # every notification lands somewhere reviewable. send_message() below resolves Bcc
+    # into the SMTP recipient list but strips the header from what is actually
+    # transmitted, so the visible recipients never see the sender listed twice.
+    if sender.lower() not in {a.strip().lower() for a in recipient.split(',')}:
+        message['Bcc']=sender
+    try:
+        if use_ssl:
+            with smtplib.SMTP_SSL(host, port, timeout=10) as smtp:
+                if username and password:
+                    smtp.login(username, password)
+                smtp.send_message(message)
+        else:
+            with smtplib.SMTP(host, port, timeout=10) as smtp:
+                if use_tls:
+                    smtp.starttls()
+                if username and password:
+                    smtp.login(username, password)
+                smtp.send_message(message)
+        db.add(EmailLog(recipient_email=recipient, subject=subject, status='SUCCESS'))
+        db.commit()
+        return True
+    except Exception as error:
+        logger.exception('Failed to send email for %s', log_context)
+        db.rollback()
+        db.add(EmailLog(recipient_email=recipient, subject=subject, status='ERROR', error_message=str(error)[:2000]))
+        db.commit()
         return False
 
+def send_substitution_email(db:Session, absence:Absence, substitute_teacher_id:int) -> bool:
     substitute=db.get(Teacher, substitute_teacher_id)
     absent=db.get(Teacher, absence.absent_teacher_id)
     time_slot=db.get(TimeSlot, absence.timeslot_id)
@@ -139,8 +188,7 @@ def send_substitution_email(db:Session, absence:Absence, substitute_teacher_id:i
     classroom_name=getattr(absence,'classroom',None) or 'no disponible'
 
     message=EmailMessage()
-    message['Subject']=f'Sustitución asignada: {time_slot.weekday} sesión {time_slot.period_number}'
-    message['From']=sender
+    message['Subject']=f'[NUEVA ASIGNACIÓN] Sustitución asignada: {time_slot.weekday} sesión {time_slot.period_number}'
     message['To']=substitute.email
     message.set_content(
         '\n'.join([
@@ -158,21 +206,71 @@ def send_substitution_email(db:Session, absence:Absence, substitute_teacher_id:i
             'Recibirás este aviso porque la sustitución te ha sido asignada en el sistema.',
         ])
     )
+    return _deliver_email(db, message, f'substitution absence_id={absence.id}')
 
-    try:
-        if use_ssl:
-            with smtplib.SMTP_SSL(host, port, timeout=10) as smtp:
-                if username and password:
-                    smtp.login(username, password)
-                smtp.send_message(message)
-        else:
-            with smtplib.SMTP(host, port, timeout=10) as smtp:
-                if use_tls:
-                    smtp.starttls()
-                if username and password:
-                    smtp.login(username, password)
-                smtp.send_message(message)
-        return True
-    except Exception:
-        logger.exception('Failed to send substitution email for absence_id=%s', absence.id)
+def send_substitution_cancelled_email(db:Session, absence, substitute_teacher_id:int) -> bool:
+    """Notifies a teacher that a substitution they had assigned no longer exists,
+    because the absence behind it was deleted from the schedule."""
+    substitute=db.get(Teacher, substitute_teacher_id)
+    absent=db.get(Teacher, absence.absent_teacher_id)
+    time_slot=db.get(TimeSlot, absence.timeslot_id)
+    if not substitute or not time_slot:
+        logger.warning('Skipping cancellation email because related records are missing for absence_id=%s', absence.id)
         return False
+
+    group_name=getattr(absence,'class_group',None) or 'no disponible'
+    classroom_name=getattr(absence,'classroom',None) or 'no disponible'
+
+    message=EmailMessage()
+    message['Subject']=f'[CANCELACIÓN] Sustitución cancelada: {time_slot.weekday} sesión {time_slot.period_number}'
+    message['To']=substitute.email
+    message.set_content(
+        '\n'.join([
+            f'Hola {substitute.first_name} {substitute.last_name},',
+            '',
+            'La sustitución que tenías asignada se ha eliminado y ya no debes cubrirla:',
+            f'- Fecha: {absence.date.isoformat()}',
+            f'- Sesión: {time_slot.weekday} sesión {time_slot.period_number} ({time_slot.start_time.strftime("%H:%M")}-{time_slot.end_time.strftime("%H:%M")})',
+            f'- Profesor/a ausente: {absent.first_name} {absent.last_name}' if absent else '- Profesor/a ausente: no disponible',
+            f'- Grupo: {group_name}',
+            f'- Aula: {classroom_name}',
+            '',
+            'Recibirás este aviso porque la sustitución cancelada estaba asignada a ti en el sistema.',
+        ])
+    )
+    return _deliver_email(db, message, f'substitution cancellation absence_id={absence.id}')
+
+def send_absence_updated_email(db:Session, absence, substitute_teacher_id:int) -> bool:
+    """Notifies the already-assigned substitute that the task or classroom of a
+    substitution they're covering changed after the original assignment email was
+    sent, so they don't show up with outdated instructions."""
+    substitute=db.get(Teacher, substitute_teacher_id)
+    absent=db.get(Teacher, absence.absent_teacher_id)
+    time_slot=db.get(TimeSlot, absence.timeslot_id)
+    if not substitute or not time_slot:
+        logger.warning('Skipping absence-update email because related records are missing for absence_id=%s', absence.id)
+        return False
+
+    group_name=getattr(absence,'class_group',None) or 'no disponible'
+    classroom_name=getattr(absence,'classroom',None) or 'no disponible'
+
+    message=EmailMessage()
+    message['Subject']=f'[ACTUALIZACIÓN] Tarea modificada para tu guardia en {group_name}'
+    message['To']=substitute.email
+    message.set_content(
+        '\n'.join([
+            f'Hola {substitute.first_name} {substitute.last_name},',
+            '',
+            'Se han actualizado los datos de la sustitución que ya tienes asignada:',
+            f'- Fecha: {absence.date.isoformat()}',
+            f'- Sesión: {time_slot.weekday} sesión {time_slot.period_number} ({time_slot.start_time.strftime("%H:%M")}-{time_slot.end_time.strftime("%H:%M")})',
+            f'- Profesor/a ausente: {absent.first_name} {absent.last_name}' if absent else '- Profesor/a ausente: no disponible',
+            f'- Grupo: {group_name}',
+            f'- Aula: {classroom_name}',
+            f'- Tarea: {absence.task_left}',
+            f'- Observaciones: {absence.observations or "-"}',
+            '',
+            'Estos datos sustituyen a los que recibiste en el aviso anterior.',
+        ])
+    )
+    return _deliver_email(db, message, f'absence update absence_id={absence.id}')

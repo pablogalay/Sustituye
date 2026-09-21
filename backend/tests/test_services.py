@@ -14,8 +14,8 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.database import Base
-from app.models import Absence, Availability, Teacher, TimeSlot
-from app.services import assign_substitute, send_substitution_email
+from app.models import Absence, Availability, EmailLog, Teacher, TimeSlot
+from app.services import assign_substitute, send_substitution_cancelled_email, send_substitution_email
 
 
 # --- assign_substitute: SUPPORT fallback -------------------------------------
@@ -72,9 +72,19 @@ def test_assign_substitute_prefers_guard_over_support(db):
 class FakeDB:
     def __init__(self, records):
         self._records = records
+        self.logged = []
 
     def get(self, model, identifier):
         return self._records.get((model, identifier))
+
+    def add(self, obj):
+        self.logged.append(obj)
+
+    def commit(self):
+        pass
+
+    def rollback(self):
+        pass
 
 
 def _absence(**overrides):
@@ -247,6 +257,63 @@ def test_returns_false_when_smtp_transport_raises(monkeypatch, exception):
     assert send_substitution_email(_fake_db_with_recipients(), _absence(), 1) is False
 
 
+def test_bcc_added_to_sender_mailbox_as_an_auditable_copy(monkeypatch):
+    monkeypatch.setenv('SMTP_HOST', 'smtp.example.com')
+    monkeypatch.setenv('SMTP_FROM', 'no-reply@example.com')
+    monkeypatch.setattr('app.services.smtplib.SMTP', RecordingSMTP)
+    monkeypatch.setattr('app.services.smtplib.SMTP_SSL', RecordingSMTP_SSL)
+
+    assert send_substitution_email(_fake_db_with_recipients(), _absence(), 1) is True
+    sent_message = next(call[1] for call in RecordingSMTP.calls if call[0] == 'send_message')
+    assert sent_message['Bcc'] == 'no-reply@example.com'
+
+
+def test_bcc_not_duplicated_when_sender_is_already_the_recipient(monkeypatch):
+    monkeypatch.setenv('SMTP_HOST', 'smtp.example.com')
+    monkeypatch.setenv('SMTP_FROM', 'ana@example.com')
+    monkeypatch.setattr('app.services.smtplib.SMTP', RecordingSMTP)
+    monkeypatch.setattr('app.services.smtplib.SMTP_SSL', RecordingSMTP_SSL)
+
+    assert send_substitution_email(_fake_db_with_recipients(), _absence(), 1) is True
+    sent_message = next(call[1] for call in RecordingSMTP.calls if call[0] == 'send_message')
+    assert sent_message['Bcc'] is None
+
+
+def test_logs_a_success_entry_in_email_log(monkeypatch):
+    monkeypatch.setenv('SMTP_HOST', 'smtp.example.com')
+    monkeypatch.setenv('SMTP_FROM', 'no-reply@example.com')
+    monkeypatch.setattr('app.services.smtplib.SMTP', RecordingSMTP)
+    monkeypatch.setattr('app.services.smtplib.SMTP_SSL', RecordingSMTP_SSL)
+
+    db = _fake_db_with_recipients()
+    assert send_substitution_email(db, _absence(), 1) is True
+    assert len(db.logged) == 1
+    entry = db.logged[0]
+    assert isinstance(entry, EmailLog)
+    assert entry.status == 'SUCCESS'
+    assert entry.recipient_email == 'ana@example.com'
+    assert entry.error_message is None
+
+
+def test_logs_an_error_entry_in_email_log_when_smtp_transport_raises(monkeypatch):
+    monkeypatch.setenv('SMTP_HOST', 'smtp.example.com')
+    monkeypatch.setenv('SMTP_FROM', 'no-reply@example.com')
+
+    class RaisingSMTP(RecordingSMTP):
+        def send_message(self, message):
+            raise smtplib.SMTPConnectError(421, 'cannot connect')
+
+    monkeypatch.setattr('app.services.smtplib.SMTP', RaisingSMTP)
+    monkeypatch.setattr('app.services.smtplib.SMTP_SSL', RaisingSMTP)
+
+    db = _fake_db_with_recipients()
+    assert send_substitution_email(db, _absence(), 1) is False
+    assert len(db.logged) == 1
+    entry = db.logged[0]
+    assert entry.status == 'ERROR'
+    assert entry.error_message
+
+
 def test_email_body_falls_back_to_placeholder_when_group_and_classroom_missing(monkeypatch):
     monkeypatch.setenv('SMTP_HOST', 'smtp.example.com')
     monkeypatch.setenv('SMTP_FROM', 'no-reply@example.com')
@@ -258,3 +325,53 @@ def test_email_body_falls_back_to_placeholder_when_group_and_classroom_missing(m
     sent_message = next(call[1] for call in RecordingSMTP.calls if call[0] == 'send_message')
     body = sent_message.get_content()
     assert 'no disponible' in body
+
+
+# --- send_substitution_cancelled_email ----------------------------------------
+
+
+def test_cancellation_returns_false_when_smtp_host_not_configured(monkeypatch):
+    _clear_smtp_env(monkeypatch)
+    assert send_substitution_cancelled_email(FakeDB({}), _absence(), 1) is False
+
+
+def test_cancellation_returns_false_when_substitute_teacher_missing(monkeypatch):
+    monkeypatch.setenv('SMTP_HOST', 'smtp.example.com')
+    monkeypatch.setenv('SMTP_FROM', 'no-reply@example.com')
+    time_slot = SimpleNamespace(weekday='Monday', period_number=1, start_time=time(9), end_time=time(10))
+    db = FakeDB({(TimeSlot, 1): time_slot})
+    assert send_substitution_cancelled_email(db, _absence(timeslot_id=1), substitute_teacher_id=999) is False
+
+
+def test_cancellation_returns_false_when_timeslot_missing(monkeypatch):
+    monkeypatch.setenv('SMTP_HOST', 'smtp.example.com')
+    monkeypatch.setenv('SMTP_FROM', 'no-reply@example.com')
+    substitute = SimpleNamespace(id=1, first_name='Ana', last_name='López', email='ana@example.com')
+    db = FakeDB({(Teacher, 1): substitute})
+    assert send_substitution_cancelled_email(db, _absence(timeslot_id=999), substitute_teacher_id=1) is False
+
+
+def test_cancellation_sends_to_the_previously_assigned_substitute(monkeypatch):
+    monkeypatch.setenv('SMTP_HOST', 'smtp.example.com')
+    monkeypatch.setenv('SMTP_FROM', 'no-reply@example.com')
+    monkeypatch.setattr('app.services.smtplib.SMTP', RecordingSMTP)
+    monkeypatch.setattr('app.services.smtplib.SMTP_SSL', RecordingSMTP_SSL)
+
+    assert send_substitution_cancelled_email(_fake_db_with_recipients(), _absence(), 1) is True
+    sent_message = next(call[1] for call in RecordingSMTP.calls if call[0] == 'send_message')
+    assert sent_message['To'] == 'ana@example.com'
+    assert 'cancelada' in sent_message['Subject']
+    body = sent_message.get_content()
+    assert 'eliminado' in body and '4B' in body and 'Aula 12' in body
+
+
+def test_cancellation_email_body_falls_back_to_placeholder_when_group_and_classroom_missing(monkeypatch):
+    monkeypatch.setenv('SMTP_HOST', 'smtp.example.com')
+    monkeypatch.setenv('SMTP_FROM', 'no-reply@example.com')
+    monkeypatch.setattr('app.services.smtplib.SMTP', RecordingSMTP)
+    monkeypatch.setattr('app.services.smtplib.SMTP_SSL', RecordingSMTP_SSL)
+
+    absence = _absence(class_group=None, classroom=None)
+    assert send_substitution_cancelled_email(_fake_db_with_recipients(), absence, 1) is True
+    sent_message = next(call[1] for call in RecordingSMTP.calls if call[0] == 'send_message')
+    assert 'no disponible' in sent_message.get_content()

@@ -57,6 +57,65 @@ def test_delete_absence_and_block_teacher_delete(monkeypatch):
     assert client.delete(f'/absences/{absence_id}',headers=auth()).status_code==204
     assert client.delete(f'/teachers/{substitute_teacher_id}',headers=auth()).status_code==204
 
+def test_delete_absence_notifies_the_substitute_of_the_cancellation(monkeypatch):
+    monkeypatch.setattr('app.main.send_substitution_email', lambda db, absence, substitute_teacher_id: True)
+    notified={}
+    monkeypatch.setattr('app.main.send_substitution_cancelled_email', lambda db, absence, substitute_teacher_id: notified.update(substitute_teacher_id=substitute_teacher_id, class_group=absence.class_group, classroom=absence.classroom) or True)
+
+    substitute_teacher=client.post('/teachers',headers=auth(),json={'first_name':'Notif','last_name':'Icado','email':'notificado@example.com','active':True,'password':'password123'})
+    assert substitute_teacher.status_code==201
+    substitute_teacher_id=substitute_teacher.json()['id']
+    absent_teacher=client.post('/teachers',headers=auth(),json={'first_name':'Aus2','last_name':'Ente2','email':'ausente2@example.com','active':True,'password':'password123'})
+    assert absent_teacher.status_code==201
+    monkeypatch.setattr('app.main.assign_substitute', lambda db, absence: substitute_teacher_id)
+    created=client.post('/absences',headers=auth(),json={'date':'2026-08-13','timeslot_id':1,'absent_teacher_id':absent_teacher.json()['id'],'class_group':'NotifGroup','classroom':'NotifRoom','task_left':'Trabajo','observations':'-'})
+    assert created.status_code==201
+
+    assert client.delete(f"/absences/{created.json()['id']}",headers=auth()).status_code==204
+
+    assert notified=={'substitute_teacher_id':substitute_teacher_id,'class_group':'NotifGroup','classroom':'NotifRoom'}
+
+def test_delete_absence_skips_cancellation_email_when_never_covered(monkeypatch):
+    called=[]
+    monkeypatch.setattr('app.main.send_substitution_cancelled_email', lambda db, absence, substitute_teacher_id: called.append(substitute_teacher_id) or True)
+    monkeypatch.setattr('app.main.assign_substitute', lambda db, absence: None)
+    absent_teacher=client.post('/teachers',headers=auth(),json={'first_name':'Aus3','last_name':'Ente3','email':'ausente3@example.com','active':True,'password':'password123'})
+    assert absent_teacher.status_code==201
+    created=client.post('/absences',headers=auth(),json={'date':'2026-08-14','timeslot_id':1,'absent_teacher_id':absent_teacher.json()['id'],'class_group':'NoSub','classroom':'NoSubRoom','task_left':'Trabajo','observations':'-'})
+    assert created.status_code==201
+    assert created.json()['substitute_teacher_id'] is None
+
+    assert client.delete(f"/absences/{created.json()['id']}",headers=auth()).status_code==204
+
+    assert called==[]
+
+def test_delete_absence_releases_substitute_statistic():
+    substitute=client.post('/teachers',headers=auth(),json={'first_name':'Rel','last_name':'Ease','email':'release@example.com','active':True,'password':'password123'})
+    assert substitute.status_code==201
+    substitute_id=substitute.json()['id']
+    absent=client.post('/teachers',headers=auth(),json={'first_name':'Abs','last_name':'Ent','email':'absent-release@example.com','active':True,'password':'password123'})
+    assert absent.status_code==201
+    absent_id=absent.json()['id']
+    assert client.put('/availability',headers=auth(),json={'teacher_id':substitute_id,'entries':[{'timeslot_id':3,'duty_type':'GUARD'}]}).status_code==200
+
+    created=client.post('/absences',headers=auth(),json={'date':'2026-08-12','timeslot_id':3,'absent_teacher_id':absent_id,'class_group':'1A','classroom':'A1','task_left':'Trabajo','observations':'-'})
+    assert created.status_code==201
+    assigned_id=created.json()['substitute_teacher_id']
+    assert assigned_id is not None
+
+    db=SessionLocal()
+    stat_before=db.get(AssignmentStatistic,(assigned_id,3))
+    weight=db.get(Teacher,assigned_id).duty_weight
+    count_before=stat_before.assignment_count
+    db.close()
+
+    assert client.delete(f"/absences/{created.json()['id']}",headers=auth()).status_code==204
+
+    db=SessionLocal()
+    stat_after=db.get(AssignmentStatistic,(assigned_id,3))
+    db.close()
+    assert stat_after.assignment_count==count_before-weight
+
 def test_sync_educamadrid_relays_result(monkeypatch):
     captured={}
     class FakeResponse:
@@ -152,6 +211,12 @@ def test_send_substitution_email_uses_transient_group_and_classroom(monkeypatch)
             if model is TimeSlot and identifier == 1:
                 return time_slot
             return None
+        def add(self, obj):
+            pass
+        def commit(self):
+            pass
+        def rollback(self):
+            pass
 
     from app.services import send_substitution_email
     assert send_substitution_email(FakeDB(), absence, substitute.id) is True

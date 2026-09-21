@@ -1,7 +1,13 @@
-import React,{useEffect,useState} from 'react';
+import React,{useEffect,useMemo,useState} from 'react';
 import {createRoot} from 'react-dom/client';
-import {AddRounded,AnalyticsRounded,ArrowForwardRounded,CalendarMonthRounded,CheckCircleRounded,CloseRounded,DashboardRounded,DeleteForeverRounded,DescriptionRounded,DownloadRounded,HistoryRounded,MeetingRoomRounded,LogoutRounded,MenuRounded,PeopleAltRounded,SchoolRounded,ShieldRounded,StorageRounded,SyncRounded,UploadRounded,WarningAmberRounded} from '@mui/icons-material';
-import {Alert,AppBar,Avatar,Box,Button,Card,Chip,CircularProgress,CssBaseline,Dialog,DialogActions,DialogContent,DialogContentText,DialogTitle,Divider,Drawer,FormControl,IconButton,InputLabel,List,ListItemButton,ListItemIcon,ListItemText,ListSubheader,MenuItem,Paper,Select,Stack,TextField,ThemeProvider,Toolbar,Tooltip,Typography,createTheme,useMediaQuery} from '@mui/material';
+import {AddRounded,AnalyticsRounded,ArrowForwardRounded,CalendarMonthRounded,CheckCircleRounded,CloseRounded,DashboardRounded,DeleteForeverRounded,DescriptionRounded,DownloadRounded,EditRounded,HistoryRounded,MailOutlineRounded,MeetingRoomRounded,LogoutRounded,MenuRounded,PeopleAltRounded,PersonAddAlt1Rounded,SchoolRounded,ShieldRounded,StorageRounded,SyncRounded,UploadRounded,WarningAmberRounded} from '@mui/icons-material';
+import {Alert,AppBar,Autocomplete,Avatar,Box,Button,Card,Chip,CircularProgress,CssBaseline,Dialog,DialogActions,DialogContent,DialogContentText,DialogTitle,Divider,Drawer,FormControl,FormHelperText,IconButton,InputLabel,List,ListItemButton,ListItemIcon,ListItemText,MenuItem,Paper,Select,Snackbar,Stack,Table,TableBody,TableCell,TableContainer,TableHead,TableRow,TextField,ThemeProvider,Toolbar,Tooltip,Typography,createTheme,useMediaQuery} from '@mui/material';
+import {alpha} from '@mui/material/styles';
+import {DatePicker} from '@mui/x-date-pickers/DatePicker';
+import {LocalizationProvider} from '@mui/x-date-pickers/LocalizationProvider';
+import {AdapterDayjs} from '@mui/x-date-pickers/AdapterDayjs';
+import dayjs from 'dayjs';
+import type {Dayjs} from 'dayjs';
 
 type Teacher={id:number;first_name:string;last_name:string;email:string;active:boolean;duty_weight:number};
 type Group={id:number;name:string};
@@ -10,6 +16,13 @@ type Slot={id:number;weekday:string;period_number:number;start_time:string;end_t
 type User={sub:string;role:'admin'|'teacher';teacher_id?:number};
 type HallwayDuty={id:number;date:string;timeslot_id:number;post:string;label:string;teacher_id:number|null};
 type Absence={id:number;date:string;timeslot_id:number;absent_teacher_id:number;class_group_id:number;classroom_id:number;task_left:string;observations?:string|null;substitute_teacher_id?:number|null;created_at?:string};
+type EmailLogEntry={id:number;recipient_email:string;subject:string;sent_at:string;status:'SUCCESS'|'ERROR';error_message:string|null};
+type TeacherAvailabilityStatus='GUARD'|'SUPPORT'|'BUSY'|'ABSENT'|'UNAVAILABLE';
+type TeacherStatusEntry={id:number;first_name:string;last_name:string;status:TeacherAvailabilityStatus};
+const STATUS_LABEL:Record<TeacherAvailabilityStatus,string>={GUARD:'Guardia',SUPPORT:'Apoyo',BUSY:'Ocupado/a (cubriendo otra clase)',ABSENT:'Ausente en esta sesión',UNAVAILABLE:'Sin disponibilidad'};
+const STATUS_COLOR:Record<TeacherAvailabilityStatus,'primary'|'secondary'|'warning'|'error'|'default'>={GUARD:'primary',SUPPORT:'secondary',BUSY:'warning',ABSENT:'error',UNAVAILABLE:'default'};
+const STATUS_GROUP=(status:TeacherAvailabilityStatus)=>status==='GUARD'||status==='SUPPORT'?'Recomendados (Guardia/Apoyo)':'Forzar asignación (sin disponibilidad u ocupados)';
+const STATUS_PRIORITY:Record<TeacherAvailabilityStatus,number>={GUARD:0,SUPPORT:1,BUSY:2,UNAVAILABLE:3,ABSENT:4};
 const drawerWidth=272;
 // FastAPI sends `detail` as a string for the errors this API raises itself, but as a list
 // of validation objects on a 422; without unwrapping it the alert would read "[object Object]".
@@ -36,11 +49,13 @@ const apiUpload=async(path:string,file:File)=>{
 };
 const theme=createTheme({palette:{mode:'light',primary:{main:'#4f46e5'},secondary:{main:'#0f766e'},background:{default:'#f6f7fb',paper:'#fff'},text:{primary:'#172033',secondary:'#667085'},success:{main:'#15803d'},warning:{main:'#d97706'}},shape:{borderRadius:14},typography:{fontFamily:'Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',h4:{fontWeight:750,letterSpacing:'-0.035em'},h5:{fontWeight:720,letterSpacing:'-0.025em'},h6:{fontWeight:700},button:{fontWeight:700,textTransform:'none'}},components:{MuiButton:{styleOverrides:{root:{borderRadius:10,boxShadow:'none',padding:'9px 16px'},contained:{boxShadow:'0 8px 18px rgba(79,70,229,.18)'}}},MuiPaper:{styleOverrides:{root:{border:'1px solid #e9eaf2',boxShadow:'0 2px 5px rgba(16,24,40,.025)'}}},MuiTextField:{defaultProps:{size:'small'}},MuiOutlinedInput:{styleOverrides:{root:{background:'#fff'}}}}});
 const dayShort:Record<string,string>={Monday:'Lun',Tuesday:'Mar',Wednesday:'Mié',Thursday:'Jue',Friday:'Vie'};
-const dayFull:Record<string,string>={Monday:'Lunes',Tuesday:'Martes',Wednesday:'Miércoles',Thursday:'Jueves',Friday:'Viernes'};
 const slotStart=(s:Slot)=>s.start_time.slice(0,5);
 const slotRange=(s:Slot)=>`${s.start_time.slice(0,5)}–${s.end_time.slice(0,5)}`;
+// dayjs' Day.prototype.day(): 0=Sunday..6=Saturday, matching TimeSlot.weekday values used by the backend.
+const WEEKDAY_BY_DAY_INDEX=['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+const isWeekend=(d:Dayjs)=>d.day()===0||d.day()===6;
 const todayIso=()=>new Date().toISOString().slice(0,10);
-const pageTitles:Record<string,[string,string]>={Dashboard:['Resumen del día','Una vista rápida de las sustituciones y ausencias.'],Teachers:['Equipo docente','Gestiona las cuentas de acceso del profesorado.'],Availability:['Disponibilidad','Configura guardias y apoyos por sesión.'],Absence:['Comunicar ausencia','Indica los datos necesarios para asignar una sustitución.'],Substitutions:['Sustituciones','Revisa las coberturas que te han asignado.'],Hallway:['Guardias de pasillo','Tres puestos por sesión: planta baja, primera y segunda planta.'],History:['Historial','Consulta las ausencias y coberturas registradas.'],Statistics:['Estadísticas','Distribución de sustituciones por docente.']};
+const pageTitles:Record<string,[string,string]>={Dashboard:['Resumen del día','Una vista rápida de las sustituciones y ausencias.'],Teachers:['Equipo docente','Gestiona las cuentas de acceso del profesorado.'],Availability:['Disponibilidad','Configura guardias y apoyos por sesión.'],Absence:['Comunicar ausencia','Indica los datos necesarios para asignar una sustitución.'],Substitutions:['Sustituciones','Revisa las coberturas que te han asignado.'],Hallway:['Guardias de pasillo','Tres puestos por sesión: planta baja, primera y segunda planta.'],History:['Historial','Consulta las ausencias y coberturas registradas.'],Statistics:['Estadísticas','Distribución de sustituciones por docente.'],EmailLogs:['Registro de correos','Auditoría de las notificaciones enviadas por la plataforma.']};
 
 function App(){
   const compact=useMediaQuery(theme.breakpoints.down('md'));
@@ -50,10 +65,10 @@ function App(){
   const logout=()=>{localStorage.removeItem('token');setToken('');setUser(null);setMobileOpen(false)};
   if(!token)return <Login onLogin={x=>{localStorage.token=x;setToken(x)}}/>;
   if(!user)return <Box sx={{minHeight:'100vh',display:'grid',placeItems:'center'}}><CircularProgress/></Box>;
-  const admin=user.role==='admin'; const nav:[string,string,React.ReactNode][]=admin?[['Dashboard','Resumen',<DashboardRounded/>],['Teachers','Profesorado',<PeopleAltRounded/>],['Availability','Disponibilidad',<CalendarMonthRounded/>],['Absence','Comunicar ausencia',<AddRounded/>],['Substitutions','Sustituciones',<CheckCircleRounded/>],['Hallway','Guardias de pasillo',<MeetingRoomRounded/>],['History','Historial',<HistoryRounded/>],['Statistics','Estadísticas',<AnalyticsRounded/>]]:[['Absence','Comunicar ausencia',<AddRounded/>],['Substitutions','Sustituciones',<CheckCircleRounded/>],['Hallway','Guardias de pasillo',<MeetingRoomRounded/>],['History','Historial',<HistoryRounded/>],['Statistics','Estadísticas',<AnalyticsRounded/>]];
+  const admin=user.role==='admin'; const nav:[string,string,React.ReactNode][]=admin?[['Dashboard','Resumen',<DashboardRounded/>],['Teachers','Profesorado',<PeopleAltRounded/>],['Availability','Disponibilidad',<CalendarMonthRounded/>],['Absence','Comunicar ausencia',<AddRounded/>],['Substitutions','Sustituciones',<CheckCircleRounded/>],['Hallway','Guardias de pasillo',<MeetingRoomRounded/>],['History','Historial',<HistoryRounded/>],['Statistics','Estadísticas',<AnalyticsRounded/>],['EmailLogs','Registro de correos',<MailOutlineRounded/>]]:[['Absence','Comunicar ausencia',<AddRounded/>],['Substitutions','Sustituciones',<CheckCircleRounded/>],['Hallway','Guardias de pasillo',<MeetingRoomRounded/>],['History','Historial',<HistoryRounded/>],['Statistics','Estadísticas',<AnalyticsRounded/>]];
   const sidebar=<Sidebar admin={admin} nav={nav} page={page} setPage={p=>{setPage(p);setMobileOpen(false)}} logout={logout}/>;
   const [title,subtitle]=pageTitles[page];
-  return <Box sx={{minHeight:'100vh',bgcolor:'background.default'}}>{compact?<><AppBar elevation={0} position="sticky" sx={{bgcolor:'#fff',color:'text.primary',borderBottom:'1px solid #e9eaf2'}}><Toolbar><IconButton onClick={()=>setMobileOpen(true)} aria-label="Abrir navegación"><MenuRounded/></IconButton><Box sx={{ml:1.5,flex:1}}><Typography fontWeight={800}>Sustituye</Typography><Typography variant="caption" color="text.secondary">Gestión docente</Typography></Box><Avatar sx={{width:34,height:34,bgcolor:'primary.main',fontSize:14}}>{user.sub[0].toUpperCase()}</Avatar></Toolbar></AppBar><Drawer open={mobileOpen} onClose={()=>setMobileOpen(false)} PaperProps={{sx:{width:drawerWidth,border:0}}}>{sidebar}</Drawer></>:<Drawer variant="permanent" PaperProps={{sx:{width:drawerWidth,border:0,borderRight:'1px solid #e9eaf2'}}}>{sidebar}</Drawer>}<Box component="main" sx={{ml:{md:`${drawerWidth}px`},p:{xs:2,sm:3,lg:4},maxWidth:{xl:1640},mx:'auto'}}><Stack direction="row" alignItems="flex-start" justifyContent="space-between" sx={{mb:3.5}}><Box><Typography variant="h4">{title}</Typography><Typography color="text.secondary" sx={{mt:.65}}>{subtitle}</Typography></Box>{page==='Absence'&&<Chip icon={<ShieldRounded/>} label={admin?'Acceso administrativo':'Solo tu propia ausencia'} color="primary" variant="outlined"/>}</Stack>{page==='Dashboard'&&admin&&<Dashboard teachers={teachers} slots={slots}/>} {page==='Teachers'&&admin&&<Teachers teachers={teachers} reload={()=>refresh(user)}/>} {page==='Availability'&&admin&&<Availability teachers={teachers} slots={slots}/>} {page==='Absence'&&<AbsenceForm teachers={teachers} slots={slots} currentTeacherId={user.teacher_id}/>} {page==='Substitutions'&&<Substitutions admin={admin} teachers={teachers} slots={slots} groups={groups} classrooms={classrooms} currentTeacherId={user.teacher_id}/>} {page==='Hallway'&&<Hallway teachers={teachers} slots={slots} currentTeacherId={user.teacher_id}/>} {page==='History'&&<History teachers={teachers} slots={slots} groups={groups} classrooms={classrooms}/>} {page==='Statistics'&&<Stats admin={admin} currentTeacherId={user.teacher_id}/>}</Box></Box>;
+  return <Box sx={{minHeight:'100vh',bgcolor:'background.default'}}>{compact?<><AppBar elevation={0} position="sticky" sx={{bgcolor:'#fff',color:'text.primary',borderBottom:'1px solid #e9eaf2'}}><Toolbar><IconButton onClick={()=>setMobileOpen(true)} aria-label="Abrir navegación"><MenuRounded/></IconButton><Box sx={{ml:1.5,flex:1}}><Typography fontWeight={800}>Sustituye</Typography><Typography variant="caption" color="text.secondary">Gestión docente</Typography></Box><Avatar sx={{width:34,height:34,bgcolor:'primary.main',fontSize:14}}>{user.sub[0].toUpperCase()}</Avatar></Toolbar></AppBar><Drawer open={mobileOpen} onClose={()=>setMobileOpen(false)} PaperProps={{sx:{width:drawerWidth,border:0}}}>{sidebar}</Drawer></>:<Drawer variant="permanent" PaperProps={{sx:{width:drawerWidth,border:0,borderRight:'1px solid #e9eaf2'}}}>{sidebar}</Drawer>}<Box component="main" sx={{ml:{md:`${drawerWidth}px`},p:{xs:2,sm:3,lg:4},maxWidth:{xl:1640},mx:'auto'}}><Stack direction="row" alignItems="flex-start" justifyContent="space-between" sx={{mb:3.5}}><Box><Typography variant="h4">{title}</Typography><Typography color="text.secondary" sx={{mt:.65}}>{subtitle}</Typography></Box>{page==='Absence'&&<Chip icon={<ShieldRounded/>} label={admin?'Acceso administrativo':'Solo tu propia ausencia'} color="primary" variant="outlined"/>}</Stack>{page==='Dashboard'&&admin&&<Dashboard teachers={teachers} slots={slots}/>} {page==='Teachers'&&admin&&<Teachers teachers={teachers} reload={()=>refresh(user)}/>} {page==='Availability'&&admin&&<Availability teachers={teachers} slots={slots}/>} {page==='Absence'&&<AbsenceForm teachers={teachers} slots={slots} groups={groups} classrooms={classrooms} currentTeacherId={user.teacher_id}/>} {page==='Substitutions'&&<Substitutions admin={admin} teachers={teachers} slots={slots} groups={groups} classrooms={classrooms} currentTeacherId={user.teacher_id}/>} {page==='Hallway'&&<Hallway teachers={teachers} slots={slots} currentTeacherId={user.teacher_id}/>} {page==='History'&&<History teachers={teachers} slots={slots} groups={groups} classrooms={classrooms}/>} {page==='Statistics'&&<Stats admin={admin} currentTeacherId={user.teacher_id}/>} {page==='EmailLogs'&&admin&&<EmailLogs/>}</Box></Box>;
 }
 function Sidebar({admin,nav,page,setPage,logout}:{admin:boolean;nav:[string,string,React.ReactNode][];page:string;setPage:(p:string)=>void;logout:()=>void}){
   return (
@@ -265,10 +280,349 @@ function Teachers({teachers,reload}:{teachers:Teacher[];reload:()=>void}){
     </Paper>
   </Stack>
 }
-function Availability({teachers,slots}:{teachers:Teacher[];slots:Slot[]}){const [rows,setRows]=useState<any[]>([]);useEffect(()=>{api('/availability').then(setRows)},[]);const selected=(id:number)=>rows.filter(x=>x.teacher_id===id);const save=async(t:number,s:number,type:string)=>{const entries=selected(t).filter(x=>x.timeslot_id!==s).concat(type?[{timeslot_id:s,duty_type:type}]:[]).map(x=>({timeslot_id:x.timeslot_id,duty_type:x.duty_type}));await api('/availability',{method:'PUT',body:JSON.stringify({teacher_id:t,entries})});setRows(await api('/availability'))};return <Paper sx={{borderRadius:3,overflow:'hidden'}}><Box sx={{p:2.5,borderBottom:'1px solid #eceef4'}}><Typography variant="h6">Planificación semanal</Typography><Stack direction="row" spacing={1} sx={{mt:1}}><Chip label="G · Guardia" size="small" color="primary" variant="outlined"/><Chip label="A · Apoyo" size="small" color="secondary" variant="outlined"/></Stack></Box><Box sx={{overflowX:'auto'}}><Box component="table" sx={{width:'100%',borderCollapse:'collapse',minWidth:980,'th':{p:1.25,bgcolor:'#f8f9fc',fontSize:12,color:'text.secondary',fontWeight:800,whiteSpace:'nowrap',borderBottom:'1px solid #e9eaf2'},'td':{p:1,borderBottom:'1px solid #f0f1f5',textAlign:'center'},'td:first-of-type':{textAlign:'left',fontWeight:700,whiteSpace:'nowrap'}}}><thead><tr><th style={{textAlign:'left'}}>Profesor/a</th>{slots.map(s=><th key={s.id}>{dayShort[s.weekday]}<br/>{slotStart(s)}</th>)}</tr></thead><tbody>{teachers.map(t=><tr key={t.id}><td>{t.first_name} {t.last_name}</td>{slots.map(s=>{const value=selected(t.id).find(x=>x.timeslot_id===s.id)?.duty_type||'';return <td key={s.id}><select aria-label={`${t.last_name} ${s.weekday} sesión ${slotRange(s)}`} value={value} onChange={e=>save(t.id,s.id,e.target.value)} style={{border:'1px solid #e1e5ee',borderRadius:7,padding:'5px',background:'#fff',fontWeight:700,color:value==='GUARD'?'#4338ca':value==='SUPPORT'?'#0f766e':'#98a2b3'}}><option value="">—</option><option value="GUARD">G</option><option value="SUPPORT">A</option></select></td>})}</tr>)}</tbody></Box></Box></Paper>}
-function AbsenceForm({teachers,slots,currentTeacherId}:{teachers:Teacher[];slots:Slot[];currentTeacherId?:number}){const [form,setForm]=useState<any>({date:new Date().toISOString().slice(0,10),timeslot_id:'',absent_teacher_id:currentTeacherId||'',class_group:'',classroom:'',task_left:'',observations:''}),[result,setResult]=useState<any>(),[error,setError]=useState('');useEffect(()=>{if(currentTeacherId)setForm((v:any)=>({...v,absent_teacher_id:currentTeacherId}))},[currentTeacherId]);const set=(key:string,value:any)=>setForm({...form,[key]:value});const renderGroupedSlots=()=>{const items:JSX.Element[]=[];slots.forEach((s,i)=>{if(i===0||slots[i-1].weekday!==s.weekday){items.push(<ListSubheader key={`header-${s.weekday}-${s.id}`}>{dayFull[s.weekday]||s.weekday}</ListSubheader>);}items.push(<MenuItem key={s.id} value={s.id}>{slotRange(s)}</MenuItem>);});return items;};const groupedSlots=(<FormControl fullWidth><InputLabel>Sesión afectada</InputLabel><Select label="Sesión afectada" value={form.timeslot_id} onChange={e=>set('timeslot_id',e.target.value)}>{renderGroupedSlots()}</Select></FormControl>);const submit=async()=>{try{setError('');setResult(await api('/absences',{method:'POST',body:JSON.stringify(form)}))}catch(e:any){setError(e.message)}};return <Box sx={{maxWidth:880}}><Paper sx={{p:{xs:2,sm:3.5},borderRadius:3}}><Stack direction="row" spacing={1.5} alignItems="center" sx={{mb:3}}><Avatar variant="rounded" sx={{bgcolor:'#eef2ff',color:'primary.main'}}><DescriptionRounded/></Avatar><Box><Typography variant="h6">Datos de la ausencia</Typography><Typography variant="body2" color="text.secondary">La sustitución se asignará automáticamente al guardar.</Typography></Box></Stack><Stack spacing={2.25}><Box sx={{display:'grid',gridTemplateColumns:{xs:'1fr',sm:'1fr 1fr'},gap:2}}><TextField fullWidth label="Fecha" type="date" value={form.date} onChange={e=>set('date',e.target.value)} slotProps={{inputLabel:{shrink:true}}}/>{groupedSlots}</Box>{!currentTeacherId&&<FormControl fullWidth><InputLabel>Profesor/a ausente</InputLabel><Select label="Profesor/a ausente" value={form.absent_teacher_id} onChange={e=>set('absent_teacher_id',e.target.value)}>{teachers.map(t=><MenuItem key={t.id} value={t.id}>{t.first_name} {t.last_name}</MenuItem>)}</Select></FormControl>}<Box sx={{display:'grid',gridTemplateColumns:{xs:'1fr',sm:'1fr 1fr'},gap:2}}><TextField fullWidth required label="Grupo" placeholder="Ej. 3º ESO B" value={form.class_group} onChange={e=>set('class_group',e.target.value)}/><TextField fullWidth required label="Aula" placeholder="Ej. B-204" value={form.classroom} onChange={e=>set('classroom',e.target.value)}/></Box><TextField fullWidth required label="Tarea o instrucciones" placeholder="Indica el trabajo que debe realizar el grupo" multiline minRows={3} value={form.task_left} onChange={e=>set('task_left',e.target.value)}/><TextField fullWidth label="Observaciones" placeholder="Información adicional para la persona sustituta" multiline minRows={2} value={form.observations} onChange={e=>set('observations',e.target.value)}/>{error&&<Alert severity="error">{error}</Alert>}{result&&<Alert severity={result.substitute_teacher_id?'success':'warning'} icon={result.substitute_teacher_id?<CheckCircleRounded/>:<WarningAmberRounded/>}>{result.substitute_teacher_id?'Ausencia registrada y sustitución asignada correctamente.':'Ausencia registrada, pero todavía no hay una persona disponible para cubrirla.'}</Alert>}<Box sx={{display:'flex',justifyContent:'flex-end'}}><Button size="large" variant="contained" startIcon={<CheckCircleRounded/>} onClick={submit} disabled={!form.timeslot_id||!form.absent_teacher_id||!form.class_group.trim()||!form.classroom.trim()||!form.task_left.trim()}>Registrar ausencia</Button></Box></Stack></Paper></Box>}
+// Sticky first column keeps the teacher name visible while scrolling horizontally through the week;
+// it needs a solid theme background (not the alpha-tinted zebra color) so scrolling cells don't bleed through it.
+const stickyHeadCellSx={position:'sticky' as const,left:0,zIndex:2,bgcolor:'#f8f9fc',p:1.25,fontSize:12,color:'text.secondary',fontWeight:800,whiteSpace:'nowrap' as const,textAlign:'left' as const,borderBottom:'1px solid #e9eaf2'};
+const headCellSx={p:1.25,bgcolor:'#f8f9fc',fontSize:12,color:'text.secondary',fontWeight:800,whiteSpace:'nowrap' as const,textAlign:'center' as const,borderBottom:'1px solid #e9eaf2'};
+const stickyBodyCellSx={position:'sticky' as const,left:0,zIndex:1,bgcolor:'background.paper',p:1,fontWeight:700,whiteSpace:'nowrap' as const,borderBottom:'1px solid #f0f1f5'};
+function Availability({teachers,slots}:{teachers:Teacher[];slots:Slot[]}){
+  const [rows,setRows]=useState<any[]>([]);
+  useEffect(()=>{api('/availability').then(setRows)},[]);
+  const selected=(id:number)=>rows.filter(x=>x.teacher_id===id);
+  const save=async(t:number,s:number,type:string)=>{
+    const entries=selected(t).filter(x=>x.timeslot_id!==s).concat(type?[{timeslot_id:s,duty_type:type}]:[]).map(x=>({timeslot_id:x.timeslot_id,duty_type:x.duty_type}));
+    await api('/availability',{method:'PUT',body:JSON.stringify({teacher_id:t,entries})});
+    setRows(await api('/availability'));
+  };
+  return <Paper sx={{borderRadius:3,overflow:'hidden'}}>
+    <Box sx={{p:2.5,borderBottom:'1px solid #eceef4'}}>
+      <Typography variant="h6">Planificación semanal</Typography>
+      <Stack direction="row" spacing={1} sx={{mt:1}}>
+        <Chip label="G · Guardia" size="small" color="primary" variant="outlined"/>
+        <Chip label="A · Apoyo" size="small" color="secondary" variant="outlined"/>
+      </Stack>
+    </Box>
+    <TableContainer sx={{overflowX:'auto'}}>
+      <Table sx={{minWidth:980,borderCollapse:'separate',borderSpacing:0}}>
+        <TableHead>
+          <TableRow>
+            <TableCell sx={stickyHeadCellSx}>Profesor/a</TableCell>
+            {slots.map(s=><TableCell key={s.id} sx={headCellSx}>{dayShort[s.weekday]}<br/>{slotStart(s)}</TableCell>)}
+          </TableRow>
+        </TableHead>
+        <TableBody>
+          {teachers.map(t=>
+            <TableRow key={t.id} sx={{
+              '&:nth-of-type(odd)':{bgcolor:theme=>alpha(theme.palette.primary.main,0.04)},
+              '&:hover':{bgcolor:theme=>alpha(theme.palette.primary.main,0.08)},
+            }}>
+              <TableCell sx={stickyBodyCellSx}>{t.first_name} {t.last_name}</TableCell>
+              {slots.map(s=>{
+                const value=selected(t.id).find(x=>x.timeslot_id===s.id)?.duty_type||'';
+                return <TableCell key={s.id} align="center" sx={{p:1,borderBottom:'1px solid #f0f1f5'}}>
+                  <select aria-label={`${t.last_name} ${s.weekday} sesión ${slotRange(s)}`} value={value} onChange={e=>save(t.id,s.id,e.target.value)} style={{border:'1px solid #e1e5ee',borderRadius:7,padding:'5px',background:'#fff',fontWeight:700,color:value==='GUARD'?'#4338ca':value==='SUPPORT'?'#0f766e':'#98a2b3'}}>
+                    <option value="">—</option>
+                    <option value="GUARD">G</option>
+                    <option value="SUPPORT">A</option>
+                  </select>
+                </TableCell>;
+              })}
+            </TableRow>
+          )}
+        </TableBody>
+      </Table>
+    </TableContainer>
+  </Paper>;
+}
+function AbsenceForm({teachers,slots,groups,classrooms,currentTeacherId}:{teachers:Teacher[];slots:Slot[];groups:Group[];classrooms:Classroom[];currentTeacherId?:number}){
+  const [form,setForm]=useState<any>({date:dayjs().format('YYYY-MM-DD'),period:'',absent_teacher_id:currentTeacherId||'',class_group:'',classroom:'',task_left:'',observations:''});
+  const [result,setResult]=useState<any>(),[error,setError]=useState('');
+  const [mine,setMine]=useState<Absence[]>([]);
+  const [editTarget,setEditTarget]=useState<Absence|null>(null);
+  const [editForm,setEditForm]=useState({classroom:'',task_left:''});
+  const [editError,setEditError]=useState('');
+  const [editSaving,setEditSaving]=useState(false);
+  const [snackbarOpen,setSnackbarOpen]=useState(false);
+  useEffect(()=>{if(currentTeacherId)setForm((v:any)=>({...v,absent_teacher_id:currentTeacherId}))},[currentTeacherId]);
+  const refreshMine=async()=>{if(currentTeacherId)setMine(await api(`/absences?date_from=${todayIso()}&teacher_id=${currentTeacherId}`))};
+  useEffect(()=>{refreshMine()},[currentTeacherId]);
+  const set=(key:string,value:any)=>setForm({...form,[key]:value});
+  // One entry per generic period (1ª, 2ª...), independent of weekday: the same slot structure repeats Monday-Friday.
+  const genericSessions=useMemo(()=>{const byPeriod=new Map<number,Slot>();slots.forEach(s=>{if(!byPeriod.has(s.period_number))byPeriod.set(s.period_number,s)});return [...byPeriod.values()].sort((a,b)=>a.period_number-b.period_number)},[slots]);
+  // Crosses the chosen date's weekday with the chosen generic period to find the exact TimeSlot id the backend expects.
+  const resolvedTimeslotId=useMemo(()=>{if(!form.date||!form.period)return undefined;const weekday=WEEKDAY_BY_DAY_INDEX[dayjs(form.date).day()];return slots.find(s=>s.weekday===weekday&&s.period_number===form.period)?.id},[form.date,form.period,slots]);
+  const submit=async()=>{try{setError('');if(!resolvedTimeslotId){setError('La fecha elegida no tiene sesiones lectivas.');return}setResult(await api('/absences',{method:'POST',body:JSON.stringify({...form,timeslot_id:resolvedTimeslotId})}));await refreshMine()}catch(e:any){setError(e.message)}};
+  const groupName=(id:number)=>groups.find(x=>x.id===id)?.name||'Grupo';
+  const classroomName=(id:number)=>classrooms.find(x=>x.id===id)?.name||'Aula';
+  const openEdit=(a:Absence)=>{setEditTarget(a);setEditForm({classroom:classroomName(a.classroom_id),task_left:a.task_left});setEditError('')};
+  const closeEdit=()=>{if(!editSaving){setEditTarget(null);setEditError('')}};
+  const saveEdit=async()=>{
+    if(!editTarget)return;
+    if(!editForm.classroom.trim()||!editForm.task_left.trim()){setEditError('El aula y la tarea no pueden estar vacías.');return}
+    try{
+      setEditSaving(true);setEditError('');
+      await api('/absences/'+editTarget.id,{method:'PATCH',body:JSON.stringify({classroom:editForm.classroom,task_left:editForm.task_left})});
+      await refreshMine();
+      setEditTarget(null);
+      setSnackbarOpen(true);
+    }catch(e:any){setEditError(e.message)}finally{setEditSaving(false)}
+  };
+  return <Stack spacing={3}>
+    <Box sx={{maxWidth:880}}><Paper sx={{p:{xs:2,sm:3.5},borderRadius:3}}><Stack direction="row" spacing={1.5} alignItems="center" sx={{mb:3}}><Avatar variant="rounded" sx={{bgcolor:'#eef2ff',color:'primary.main'}}><DescriptionRounded/></Avatar><Box><Typography variant="h6">Datos de la ausencia</Typography><Typography variant="body2" color="text.secondary">La sustitución se asignará automáticamente al guardar.</Typography></Box></Stack><Stack spacing={2.25}><Box sx={{display:'grid',gridTemplateColumns:{xs:'1fr',sm:'1fr 1fr'},gap:2}}>
+      <LocalizationProvider dateAdapter={AdapterDayjs}><DatePicker label="Fecha" value={dayjs(form.date)} onChange={(value:Dayjs|null)=>value&&set('date',value.format('YYYY-MM-DD'))} shouldDisableDate={isWeekend} slotProps={{textField:{fullWidth:true}}}/></LocalizationProvider>
+      <FormControl fullWidth><InputLabel>Sesión afectada</InputLabel><Select label="Sesión afectada" value={form.period} onChange={e=>set('period',e.target.value)}>{genericSessions.map(s=><MenuItem key={s.period_number} value={s.period_number}>{s.period_number}ª sesión ({slotRange(s)})</MenuItem>)}</Select></FormControl>
+    </Box>{!currentTeacherId&&<FormControl fullWidth><InputLabel>Profesor/a ausente</InputLabel><Select label="Profesor/a ausente" value={form.absent_teacher_id} onChange={e=>set('absent_teacher_id',e.target.value)}>{teachers.map(t=><MenuItem key={t.id} value={t.id}>{t.first_name} {t.last_name}</MenuItem>)}</Select></FormControl>}<Box sx={{display:'grid',gridTemplateColumns:{xs:'1fr',sm:'1fr 1fr'},gap:2}}><TextField fullWidth required label="Grupo" placeholder="Ej. 3º ESO B" value={form.class_group} onChange={e=>set('class_group',e.target.value)}/><TextField fullWidth required label="Aula" placeholder="Ej. B-204" value={form.classroom} onChange={e=>set('classroom',e.target.value)}/></Box><TextField fullWidth required label="Tarea o instrucciones" placeholder="Indica el trabajo que debe realizar el grupo" multiline minRows={3} value={form.task_left} onChange={e=>set('task_left',e.target.value)}/><TextField fullWidth label="Observaciones" placeholder="Información adicional para la persona sustituta" multiline minRows={2} value={form.observations} onChange={e=>set('observations',e.target.value)}/>{error&&<Alert severity="error">{error}</Alert>}{result&&<Alert severity={result.substitute_teacher_id?'success':'warning'} icon={result.substitute_teacher_id?<CheckCircleRounded/>:<WarningAmberRounded/>}>{result.substitute_teacher_id?'Ausencia registrada y sustitución asignada correctamente.':'Ausencia registrada, pero todavía no hay una persona disponible para cubrirla.'}</Alert>}<Box sx={{display:'flex',justifyContent:'flex-end'}}><Button size="large" variant="contained" startIcon={<CheckCircleRounded/>} onClick={submit} disabled={!resolvedTimeslotId||!form.absent_teacher_id||!form.class_group.trim()||!form.classroom.trim()||!form.task_left.trim()}>Registrar ausencia</Button></Box></Stack></Paper></Box>
 
-function Substitutions({admin,teachers,slots,groups,classrooms,currentTeacherId}:{admin:boolean;teachers:Teacher[];slots:Slot[];groups:Group[];classrooms:Classroom[];currentTeacherId?:number}){const [rows,setRows]=useState<Absence[]>([]);const [notice,setNotice]=useState('');const [error,setError]=useState('');useEffect(()=>{api('/absences?date_from='+todayIso()).then(setRows)},[]);const refreshRows=async()=>setRows(await api('/absences?date_from='+todayIso()));const visible=admin?rows:rows.filter(r=>r.substitute_teacher_id===currentTeacherId);const teacherName=(id?:number|null)=>teachers.find(t=>t.id===id)?.first_name+' '+teachers.find(t=>t.id===id)?.last_name||'Profesor/a';const groupName=(id:number)=>groups.find(x=>x.id===id)?.name||'Grupo';const classroomName=(id:number)=>classrooms.find(x=>x.id===id)?.name||'Aula';const deleteAbsence=async(id:number)=>{try{setError('');setNotice('');await api('/absences/'+id,{method:'DELETE'});await refreshRows();setNotice('Sustitución eliminada correctamente.')}catch(e:any){setError(e.message)}};return <Paper sx={{borderRadius:3,overflow:'hidden'}}><Box sx={{p:2.5,borderBottom:'1px solid #eceef4'}}><Typography variant="h6">Sustituciones asignadas</Typography><Typography variant="body2" color="text.secondary">{admin?'Todas las coberturas registradas en el centro.':'Tus sustituciones pendientes y realizadas.'}</Typography></Box>{(notice||error)&&<Box sx={{p:2.5}}><Alert severity={error?'error':'success'} onClose={()=>{setError('');setNotice('')}}>{error||notice}</Alert></Box>}{visible.length===0?<Empty icon={<CheckCircleRounded/>} text={admin?'Aún no hay sustituciones asignadas.':'No tienes sustituciones asignadas.'}/>:<Stack divider={<Divider flexItem/>}>{visible.map(a=>{const slot=slots.find(s=>s.id===a.timeslot_id);const substitute=teacherName(a.substitute_teacher_id);const absent=admin?teacherName(a.absent_teacher_id):'';return <Box key={a.id} sx={{p:{xs:2,sm:2.5}}}><Stack direction={{xs:'column',md:'row'}} spacing={1.5} alignItems={{md:'center'}} justifyContent="space-between"><Box sx={{flex:1}}><Stack direction="row" spacing={1} sx={{mb:1}}><Chip size="small" color={a.substitute_teacher_id===currentTeacherId&&!admin?'success':'primary'} label={slot?`${dayShort[slot.weekday]} · ${slotRange(slot)}`:'Sesión'}/>{admin&&<Chip size="small" variant="outlined" label={`Sustituye: ${substitute}`}/>}</Stack><Typography fontWeight={750}>{groupName(a.class_group_id)} · {classroomName(a.classroom_id)}</Typography><Typography variant="body2" color="text.secondary">{new Date(a.date+'T00:00:00').toLocaleDateString('es-ES')} · {a.task_left}</Typography>{a.observations&&<Typography variant="caption" color="text.secondary">{a.observations}</Typography>}{admin&&<Typography variant="caption" color="text.secondary" sx={{display:'block',mt:.5}}>Ausencia de {absent}</Typography>}</Box><Stack direction="row" spacing={1} alignItems="center"><Chip size="small" color={a.substitute_teacher_id?'success':'warning'} label={a.substitute_teacher_id?'Asignada':'Pendiente'}/>{admin&&<Button size="small" color="error" variant="outlined" onClick={()=>deleteAbsence(a.id)}>Eliminar</Button>}</Stack></Stack></Box>})}</Stack>}</Paper>}
+    {currentTeacherId&&<Box sx={{maxWidth:880}}>
+      <Paper sx={{borderRadius:3,overflow:'hidden'}}>
+        <Box sx={{p:2.5,borderBottom:'1px solid #eceef4'}}>
+          <Typography variant="h6">Tus ausencias comunicadas</Typography>
+          <Typography variant="body2" color="text.secondary">De hoy en adelante. Puedes corregir el aula o la tarea; si ya hay un sustituto/a asignado/a, se le avisará del cambio por correo.</Typography>
+        </Box>
+        {mine.length===0?<Empty icon={<DescriptionRounded/>} text="No tienes ausencias comunicadas próximamente."/>:
+          <Stack divider={<Divider flexItem/>}>{mine.map(a=>{
+            const slot=slots.find(s=>s.id===a.timeslot_id);
+            const editable=a.date>=todayIso();
+            return <Stack key={a.id} direction="row" justifyContent="space-between" alignItems="center" sx={{p:2.25}}>
+              <Box>
+                <Typography fontWeight={750}>{groupName(a.class_group_id)} · {classroomName(a.classroom_id)}</Typography>
+                <Typography variant="body2" color="text.secondary">{new Date(a.date+'T00:00:00').toLocaleDateString('es-ES')} · {slot?`${dayShort[slot.weekday]} · ${slotRange(slot)}`:'Sesión'} · {a.task_left}</Typography>
+              </Box>
+              <Stack direction="row" spacing={1} alignItems="center">
+                <Chip size="small" color={a.substitute_teacher_id?'success':'warning'} label={a.substitute_teacher_id?'Cubierta':'Pendiente'}/>
+                <Tooltip title={editable?'Editar tarea o aula':'Solo se pueden editar ausencias de hoy en adelante'}>
+                  <span><IconButton size="small" color="primary" disabled={!editable} onClick={()=>openEdit(a)}><EditRounded fontSize="small"/></IconButton></span>
+                </Tooltip>
+              </Stack>
+            </Stack>
+          })}</Stack>}
+      </Paper>
+    </Box>}
+
+    <Dialog open={!!editTarget} onClose={closeEdit} fullWidth maxWidth="sm">
+      <DialogTitle>Editar ausencia</DialogTitle>
+      <DialogContent>
+        <Stack spacing={2} sx={{mt:.5}}>
+          <DialogContentText>Solo puedes corregir el aula y la tarea. Si te equivocaste en la fecha, la sesión o el grupo, elimina esta ausencia y comunica una nueva.</DialogContentText>
+          <TextField fullWidth required label="Aula" value={editForm.classroom} onChange={e=>setEditForm(v=>({...v,classroom:e.target.value}))}/>
+          <Box>
+            <TextField fullWidth required label="Tarea o instrucciones" multiline minRows={3} value={editForm.task_left} onChange={e=>setEditForm(v=>({...v,task_left:e.target.value}))}/>
+            <FormHelperText>Consejo: si la tarea es muy larga o puede cambiar, pega aquí un enlace a un documento compartido. Así podrás modificarlo en cualquier momento.</FormHelperText>
+          </Box>
+          {editTarget?.substitute_teacher_id&&<Alert severity="info">Ya hay un sustituto/a asignado/a para esta sesión; se le enviará un correo avisando del cambio.</Alert>}
+          {editError&&<Alert severity="error">{editError}</Alert>}
+        </Stack>
+      </DialogContent>
+      <DialogActions>
+        <Button onClick={closeEdit} disabled={editSaving}>Cancelar</Button>
+        <Button variant="contained" onClick={saveEdit} disabled={editSaving} startIcon={editSaving?<CircularProgress size={16} color="inherit"/>:undefined}>Guardar cambios</Button>
+      </DialogActions>
+    </Dialog>
+    <Snackbar open={snackbarOpen} autoHideDuration={4000} onClose={()=>setSnackbarOpen(false)} message="Ausencia actualizada correctamente."/>
+  </Stack>
+}
+
+function Substitutions({admin,teachers,slots,groups,classrooms,currentTeacherId}:{admin:boolean;teachers:Teacher[];slots:Slot[];groups:Group[];classrooms:Classroom[];currentTeacherId?:number}){
+  const [rows,setRows]=useState<Absence[]>([]);
+  const [notice,setNotice]=useState('');
+  const [error,setError]=useState('');
+  const [assignTarget,setAssignTarget]=useState<Absence|null>(null);
+  const [teacherStatuses,setTeacherStatuses]=useState<TeacherStatusEntry[]>([]);
+  const [selectedSubstitute,setSelectedSubstitute]=useState<TeacherStatusEntry|null>(null);
+  const [assigning,setAssigning]=useState(false);
+  const [assignedSnackbar,setAssignedSnackbar]=useState(false);
+  const [editTarget,setEditTarget]=useState<Absence|null>(null);
+  const [editedSnackbar,setEditedSnackbar]=useState(false);
+  useEffect(()=>{api('/absences?date_from='+todayIso()).then(setRows)},[]);
+  useEffect(()=>{if(assignTarget)api(`/sessions/${assignTarget.date}/${assignTarget.timeslot_id}/teachers-status`).then(setTeacherStatuses);else setTeacherStatuses([])},[assignTarget]);
+  const refreshRows=async()=>setRows(await api('/absences?date_from='+todayIso()));
+  const visible=admin?rows:rows.filter(r=>r.substitute_teacher_id===currentTeacherId);
+  const teacherName=(id?:number|null)=>teachers.find(t=>t.id===id)?.first_name+' '+teachers.find(t=>t.id===id)?.last_name||'Profesor/a';
+  const groupName=(id:number)=>groups.find(x=>x.id===id)?.name||'Grupo';
+  const classroomName=(id:number)=>classrooms.find(x=>x.id===id)?.name||'Aula';
+  const deleteAbsence=async(id:number)=>{try{setError('');setNotice('');await api('/absences/'+id,{method:'DELETE'});await refreshRows();setNotice('Sustitución eliminada correctamente.')}catch(e:any){setError(e.message)}};
+  const openAssign=(a:Absence)=>{setAssignTarget(a);setSelectedSubstitute(null)};
+  const closeAssign=()=>{if(!assigning){setAssignTarget(null);setSelectedSubstitute(null)}};
+  const confirmAssign=async()=>{
+    if(!assignTarget||!selectedSubstitute)return;
+    try{
+      setAssigning(true);setError('');
+      await api(`/absences/${assignTarget.id}/force-assign`,{method:'PATCH',body:JSON.stringify({substitute_id:selectedSubstitute.id})});
+      await refreshRows();
+      setAssignedSnackbar(true);
+      setAssignTarget(null);setSelectedSubstitute(null);
+    }catch(e:any){setError(e.message)}finally{setAssigning(false)}
+  };
+  const targetSlot=assignTarget&&slots.find(s=>s.id===assignTarget.timeslot_id);
+  const sortedStatuses=useMemo(()=>[...teacherStatuses].sort((a,b)=>STATUS_PRIORITY[a.status]-STATUS_PRIORITY[b.status]||a.last_name.localeCompare(b.last_name)),[teacherStatuses]);
+  const forcingAssignment=!!selectedSubstitute&&selectedSubstitute.status!=='GUARD'&&selectedSubstitute.status!=='SUPPORT';
+  return <Paper sx={{borderRadius:3,overflow:'hidden'}}><Box sx={{p:2.5,borderBottom:'1px solid #eceef4'}}><Typography variant="h6">Sustituciones asignadas</Typography><Typography variant="body2" color="text.secondary">{admin?'Todas las coberturas registradas en el centro.':'Tus sustituciones pendientes y realizadas.'}</Typography></Box>{(notice||error)&&<Box sx={{p:2.5}}><Alert severity={error?'error':'success'} onClose={()=>{setError('');setNotice('')}}>{error||notice}</Alert></Box>}{visible.length===0?<Empty icon={<CheckCircleRounded/>} text={admin?'Aún no hay sustituciones asignadas.':'No tienes sustituciones asignadas.'}/>:<Stack divider={<Divider flexItem/>}>{visible.map(a=>{const slot=slots.find(s=>s.id===a.timeslot_id);const substitute=teacherName(a.substitute_teacher_id);const absent=admin?teacherName(a.absent_teacher_id):'';return <Box key={a.id} sx={{p:{xs:2,sm:2.5}}}><Stack direction={{xs:'column',md:'row'}} spacing={1.5} alignItems={{md:'center'}} justifyContent="space-between"><Box sx={{flex:1}}><Stack direction="row" spacing={1} sx={{mb:1}}><Chip size="small" color={a.substitute_teacher_id===currentTeacherId&&!admin?'success':'primary'} label={slot?`${dayShort[slot.weekday]} · ${slotRange(slot)}`:'Sesión'}/>{admin&&<Chip size="small" variant="outlined" label={`Sustituye: ${substitute}`}/>}</Stack><Typography fontWeight={750}>{groupName(a.class_group_id)} · {classroomName(a.classroom_id)}</Typography><Typography variant="body2" color="text.secondary">{new Date(a.date+'T00:00:00').toLocaleDateString('es-ES')} · {a.task_left}</Typography>{a.observations&&<Typography variant="caption" color="text.secondary">{a.observations}</Typography>}{admin&&<Typography variant="caption" color="text.secondary" sx={{display:'block',mt:.5}}>Ausencia de {absent}</Typography>}</Box><Stack direction="row" spacing={1} alignItems="center"><Chip size="small" color={a.substitute_teacher_id?'success':'warning'} label={a.substitute_teacher_id?'Asignada':'Pendiente'}/>{admin&&!a.substitute_teacher_id&&<Tooltip title="Asignar sustituto/a manualmente"><IconButton size="small" color="primary" onClick={()=>openAssign(a)}><PersonAddAlt1Rounded fontSize="small"/></IconButton></Tooltip>}{admin&&<Tooltip title="Editar ausencia (fecha, sesión, grupo, aula, tarea y sustituto/a)"><IconButton size="small" color="primary" onClick={()=>setEditTarget(a)}><EditRounded fontSize="small"/></IconButton></Tooltip>}{admin&&<Button size="small" color="error" variant="outlined" onClick={()=>deleteAbsence(a.id)}>Eliminar</Button>}</Stack></Stack></Box>})}</Stack>}
+    <Dialog open={!!assignTarget} onClose={closeAssign} fullWidth maxWidth="sm">
+      <DialogTitle>Asignar sustituto/a manualmente</DialogTitle>
+      <DialogContent>
+        {assignTarget&&<Stack spacing={2} sx={{mt:.5}}>
+          <DialogContentText>
+            {new Date(assignTarget.date+'T00:00:00').toLocaleDateString('es-ES')} · {targetSlot?`${dayShort[targetSlot.weekday]} · ${slotRange(targetSlot)}`:'Sesión'} · {groupName(assignTarget.class_group_id)} · {classroomName(assignTarget.classroom_id)}
+          </DialogContentText>
+          <Autocomplete
+            options={sortedStatuses}
+            groupBy={o=>STATUS_GROUP(o.status)}
+            getOptionLabel={o=>`${o.first_name} ${o.last_name}`}
+            getOptionDisabled={o=>o.status==='ABSENT'}
+            isOptionEqualToValue={(o,v)=>o.id===v.id}
+            value={selectedSubstitute}
+            onChange={(_,value)=>setSelectedSubstitute(value)}
+            noOptionsText="No hay profesorado activo disponible"
+            renderOption={(props,option)=>{
+              const {key,...rest}=props as any;
+              return <li key={key} {...rest}>
+                <Stack direction="row" spacing={1} alignItems="center" justifyContent="space-between" sx={{width:'100%'}}>
+                  <span>{option.first_name} {option.last_name}</span>
+                  <Chip size="small" color={STATUS_COLOR[option.status]} label={STATUS_LABEL[option.status]}/>
+                </Stack>
+              </li>;
+            }}
+            renderInput={params=><TextField {...params} label="Profesor/a sustituto/a" placeholder="Busca por nombre"/>}
+          />
+          {forcingAssignment&&<Alert severity="warning">Estás asignando a un profesor que no tiene guardia o ya está ocupado en esta franja. ¿Deseas forzar la asignación?</Alert>}
+        </Stack>}
+      </DialogContent>
+      <DialogActions>
+        <Button onClick={closeAssign} disabled={assigning}>Cancelar</Button>
+        <Button variant="contained" color={forcingAssignment?'warning':'primary'} onClick={confirmAssign} disabled={!selectedSubstitute||assigning} startIcon={assigning?<CircularProgress size={16} color="inherit"/>:undefined}>{forcingAssignment?'Forzar asignación':'Asignar'}</Button>
+      </DialogActions>
+    </Dialog>
+    <Snackbar open={assignedSnackbar} autoHideDuration={4000} onClose={()=>setAssignedSnackbar(false)} message="Sustitución asignada correctamente."/>
+    <AdminEditAbsenceDialog
+      absence={editTarget}
+      teachers={teachers}
+      slots={slots}
+      groups={groups}
+      classrooms={classrooms}
+      onClose={()=>setEditTarget(null)}
+      onSaved={async()=>{setEditTarget(null);await refreshRows();setEditedSnackbar(true)}}
+    />
+    <Snackbar open={editedSnackbar} autoHideDuration={4000} onClose={()=>setEditedSnackbar(false)} message="Ausencia actualizada correctamente."/>
+  </Paper>
+}
+function AdminEditAbsenceDialog({absence,teachers,slots,groups,classrooms,onClose,onSaved}:{absence:Absence|null;teachers:Teacher[];slots:Slot[];groups:Group[];classrooms:Classroom[];onClose:()=>void;onSaved:()=>void}){
+  const [form,setForm]=useState<{date:string;period:number|'';class_group:string;classroom:string;task_left:string;observations:string}|null>(null);
+  const [selectedSubstitute,setSelectedSubstitute]=useState<TeacherStatusEntry|null>(null);
+  const [teacherStatuses,setTeacherStatuses]=useState<TeacherStatusEntry[]>([]);
+  const [saving,setSaving]=useState(false);
+  const [error,setError]=useState('');
+
+  // Re-seeded every time a different absence is opened for editing — but never again
+  // while the same dialog stays open, so it doesn't clobber the admin's own edits.
+  useEffect(()=>{
+    if(!absence){setForm(null);setSelectedSubstitute(null);setError('');return}
+    const slot=slots.find(s=>s.id===absence.timeslot_id);
+    setForm({
+      date:absence.date,period:slot?.period_number??'',
+      class_group:groups.find(g=>g.id===absence.class_group_id)?.name||'',
+      classroom:classrooms.find(c=>c.id===absence.classroom_id)?.name||'',
+      task_left:absence.task_left,observations:absence.observations||'',
+    });
+    if(absence.substitute_teacher_id){
+      const t=teachers.find(x=>x.id===absence.substitute_teacher_id);
+      // Status is a placeholder until the teachers-status fetch below fills in the
+      // real one for the (possibly edited) date/session; grouping/color settle then.
+      setSelectedSubstitute(t?{id:t.id,first_name:t.first_name,last_name:t.last_name,status:'GUARD'}:null);
+    } else {
+      setSelectedSubstitute(null);
+    }
+    setError('');
+  },[absence?.id]);
+
+  const genericSessions=useMemo(()=>{const byPeriod=new Map<number,Slot>();slots.forEach(s=>{if(!byPeriod.has(s.period_number))byPeriod.set(s.period_number,s)});return [...byPeriod.values()].sort((a,b)=>a.period_number-b.period_number)},[slots]);
+  const resolvedTimeslotId=useMemo(()=>{if(!form?.date||!form.period)return undefined;const weekday=WEEKDAY_BY_DAY_INDEX[dayjs(form.date).day()];return slots.find(s=>s.weekday===weekday&&s.period_number===form.period)?.id},[form?.date,form?.period,slots]);
+
+  // Refetches whenever the form's OWN date/session changes (not just on open), so the
+  // Autocomplete's recommendations always reflect what's being proposed, not the original.
+  useEffect(()=>{
+    if(form?.date&&resolvedTimeslotId) api(`/sessions/${form.date}/${resolvedTimeslotId}/teachers-status`).then(setTeacherStatuses);
+    else setTeacherStatuses([]);
+  },[form?.date,resolvedTimeslotId]);
+
+  // Keeps an already-selected teacher's status badge accurate as the session changes,
+  // without ever silently swapping who is selected.
+  useEffect(()=>{
+    setSelectedSubstitute(current=>{
+      if(!current) return current;
+      const fresh=teacherStatuses.find(t=>t.id===current.id);
+      return fresh||current;
+    });
+  },[teacherStatuses]);
+
+  if(!absence||!form) return null;
+
+  const originalSubstituteId=absence.substitute_teacher_id??null;
+  const newSubstituteId=selectedSubstitute?.id??null;
+  const substituteChanged=newSubstituteId!==originalSubstituteId;
+  const oldSubstituteName=(()=>{const t=originalSubstituteId&&teachers.find(x=>x.id===originalSubstituteId);return t?`${t.first_name} ${t.last_name}`:null})();
+  const newSubstituteName=selectedSubstitute?`${selectedSubstitute.first_name} ${selectedSubstitute.last_name}`:'';
+  const sortedStatuses=[...teacherStatuses].sort((a,b)=>STATUS_PRIORITY[a.status]-STATUS_PRIORITY[b.status]||a.last_name.localeCompare(b.last_name));
+
+  const save=async()=>{
+    if(!resolvedTimeslotId){setError('La fecha elegida no tiene sesiones lectivas.');return}
+    if(!form.class_group.trim()||!form.classroom.trim()||!form.task_left.trim()){setError('Grupo, aula y tarea son obligatorios.');return}
+    try{
+      setSaving(true);setError('');
+      await api('/absences/'+absence.id,{method:'PUT',body:JSON.stringify({
+        date:form.date,timeslot_id:resolvedTimeslotId,class_group:form.class_group,classroom:form.classroom,
+        task_left:form.task_left,observations:form.observations||null,substitute_id:newSubstituteId,
+      })});
+      onSaved();
+    }catch(e:any){setError(e.message)}finally{setSaving(false)}
+  };
+
+  return <Dialog open={!!absence} onClose={()=>!saving&&onClose()} fullWidth maxWidth="sm">
+    <DialogTitle>Editar ausencia (administrador)</DialogTitle>
+    <DialogContent>
+      <Stack spacing={2} sx={{mt:.5}}>
+        <Box sx={{display:'grid',gridTemplateColumns:{xs:'1fr',sm:'1fr 1fr'},gap:2}}>
+          <LocalizationProvider dateAdapter={AdapterDayjs}><DatePicker label="Fecha" value={dayjs(form.date)} onChange={(value:Dayjs|null)=>value&&setForm(f=>f&&({...f,date:value.format('YYYY-MM-DD')}))} shouldDisableDate={isWeekend} slotProps={{textField:{fullWidth:true}}}/></LocalizationProvider>
+          <FormControl fullWidth><InputLabel>Sesión</InputLabel><Select label="Sesión" value={form.period} onChange={e=>setForm(f=>f&&({...f,period:e.target.value as number}))}>{genericSessions.map(s=><MenuItem key={s.period_number} value={s.period_number}>{s.period_number}ª sesión ({slotRange(s)})</MenuItem>)}</Select></FormControl>
+        </Box>
+        <Box sx={{display:'grid',gridTemplateColumns:{xs:'1fr',sm:'1fr 1fr'},gap:2}}>
+          <TextField fullWidth required label="Grupo" value={form.class_group} onChange={e=>setForm(f=>f&&({...f,class_group:e.target.value}))}/>
+          <TextField fullWidth required label="Aula" value={form.classroom} onChange={e=>setForm(f=>f&&({...f,classroom:e.target.value}))}/>
+        </Box>
+        <TextField fullWidth required label="Tarea o instrucciones" multiline minRows={3} value={form.task_left} onChange={e=>setForm(f=>f&&({...f,task_left:e.target.value}))}/>
+        <TextField fullWidth label="Observaciones" multiline minRows={2} value={form.observations} onChange={e=>setForm(f=>f&&({...f,observations:e.target.value}))}/>
+        <Autocomplete
+          options={sortedStatuses}
+          groupBy={o=>STATUS_GROUP(o.status)}
+          getOptionLabel={o=>`${o.first_name} ${o.last_name}`}
+          getOptionDisabled={o=>o.status==='ABSENT'}
+          isOptionEqualToValue={(o,v)=>o.id===v.id}
+          value={selectedSubstitute}
+          onChange={(_,value)=>setSelectedSubstitute(value)}
+          noOptionsText="No hay profesorado activo disponible"
+          renderOption={(props,option)=>{
+            const {key,...rest}=props as any;
+            return <li key={key} {...rest}>
+              <Stack direction="row" spacing={1} alignItems="center" justifyContent="space-between" sx={{width:'100%'}}>
+                <span>{option.first_name} {option.last_name}</span>
+                <Chip size="small" color={STATUS_COLOR[option.status]} label={STATUS_LABEL[option.status]}/>
+              </Stack>
+            </li>;
+          }}
+          renderInput={params=><TextField {...params} label="Profesor/a sustituto/a" placeholder="Déjalo en blanco para dejarla pendiente"/>}
+        />
+        {substituteChanged&&newSubstituteId&&
+          <Alert severity="info">Se restará la guardia a {oldSubstituteName||'nadie (no había sustituto/a)'} y se sumará a {newSubstituteName}. Ambos recibirán un correo automático.</Alert>}
+        {substituteChanged&&!newSubstituteId&&originalSubstituteId&&
+          <Alert severity="info">La ausencia quedará pendiente sin sustituto/a y se le devolverá (liberará) la guardia contabilizada a {oldSubstituteName}.</Alert>}
+        {error&&<Alert severity="error">{error}</Alert>}
+      </Stack>
+    </DialogContent>
+    <DialogActions>
+      <Button onClick={onClose} disabled={saving}>Cancelar</Button>
+      <Button variant="contained" onClick={save} disabled={saving} startIcon={saving?<CircularProgress size={16} color="inherit"/>:undefined}>Guardar cambios</Button>
+    </DialogActions>
+  </Dialog>;
+}
 function Hallway({teachers,slots,currentTeacherId}:{teachers:Teacher[];slots:Slot[];currentTeacherId?:number}){
   const [day,setDay]=useState(todayIso());
   const [data,setData]=useState<{posts:{post:string;label:string}[];duties:HallwayDuty[]}>();
@@ -302,6 +656,48 @@ function Hallway({teachers,slots,currentTeacherId}:{teachers:Teacher[];slots:Slo
         </Box>
       </Paper>}
   </Stack>
+}
+function EmailLogs(){
+  const [rows,setRows]=useState<EmailLogEntry[]|null>(null);
+  const [error,setError]=useState('');
+  useEffect(()=>{api('/admin/email-logs').then(setRows).catch((e:any)=>setError(e.message))},[]);
+  const formatDate=(iso:string)=>new Date(iso).toLocaleString('es-ES',{dateStyle:'short',timeStyle:'short'});
+  return <Paper sx={{borderRadius:3,overflow:'hidden'}}>
+    <Box sx={{p:2.5,borderBottom:'1px solid #eceef4'}}>
+      <Typography variant="h6">Correos enviados</Typography>
+      <Typography variant="body2" color="text.secondary">Auditoría de las notificaciones por email que envía la plataforma (asignaciones y cancelaciones de sustitución).</Typography>
+    </Box>
+    {error&&<Box sx={{p:2.5}}><Alert severity="error">{error}</Alert></Box>}
+    {!rows?(error?null:<Box sx={{p:5,display:'grid',placeItems:'center'}}><CircularProgress/></Box>):rows.length===0?<Empty icon={<MailOutlineRounded/>} text="Todavía no se ha enviado ningún correo."/>:
+      <TableContainer sx={{overflowX:'auto'}}>
+        <Table sx={{minWidth:760}}>
+          <TableHead>
+            <TableRow>
+              <TableCell sx={{p:1.25,bgcolor:'#f8f9fc',fontSize:12,color:'text.secondary',fontWeight:800,whiteSpace:'nowrap'}}>Fecha</TableCell>
+              <TableCell sx={{p:1.25,bgcolor:'#f8f9fc',fontSize:12,color:'text.secondary',fontWeight:800,whiteSpace:'nowrap'}}>Destinatario</TableCell>
+              <TableCell sx={{p:1.25,bgcolor:'#f8f9fc',fontSize:12,color:'text.secondary',fontWeight:800,whiteSpace:'nowrap'}}>Asunto</TableCell>
+              <TableCell align="center" sx={{p:1.25,bgcolor:'#f8f9fc',fontSize:12,color:'text.secondary',fontWeight:800,whiteSpace:'nowrap'}}>Estado</TableCell>
+            </TableRow>
+          </TableHead>
+          <TableBody>
+            {rows.map(row=>
+              <TableRow key={row.id} sx={{'&:nth-of-type(odd)':{bgcolor:theme=>alpha(theme.palette.primary.main,0.04)},'&:hover':{bgcolor:theme=>alpha(theme.palette.primary.main,0.08)}}}>
+                <TableCell sx={{p:1.25,whiteSpace:'nowrap',borderBottom:'1px solid #f0f1f5'}}>{formatDate(row.sent_at)}</TableCell>
+                <TableCell sx={{p:1.25,borderBottom:'1px solid #f0f1f5'}}>{row.recipient_email}</TableCell>
+                <TableCell sx={{p:1.25,borderBottom:'1px solid #f0f1f5'}}>{row.subject}</TableCell>
+                <TableCell align="center" sx={{p:1.25,borderBottom:'1px solid #f0f1f5'}}>
+                  {row.status==='SUCCESS'
+                    ? <Chip size="small" color="success" label="Enviado"/>
+                    : <Tooltip title={row.error_message||'Error desconocido'}>
+                        <Chip size="small" color="error" label="Fallido"/>
+                      </Tooltip>}
+                </TableCell>
+              </TableRow>
+            )}
+          </TableBody>
+        </Table>
+      </TableContainer>}
+  </Paper>;
 }
 function History({teachers,slots,groups,classrooms}:{teachers:Teacher[];slots:Slot[];groups:Group[];classrooms:Classroom[]}){const [rows,setRows]=useState<Absence[]>([]);useEffect(()=>{api('/absences').then(setRows)},[]);const teacherName=(id?:number|null)=>teachers.find(t=>t.id===id)?.first_name+' '+teachers.find(t=>t.id===id)?.last_name||'Profesor/a';const groupName=(id:number)=>groups.find(x=>x.id===id)?.name||'Grupo';const classroomName=(id:number)=>classrooms.find(x=>x.id===id)?.name||'Aula';return <Paper sx={{borderRadius:3,overflow:'hidden'}}><Box sx={{p:2.5,borderBottom:'1px solid #eceef4'}}><Typography variant="h6">Últimos registros</Typography><Typography variant="body2" color="text.secondary">Ausencias, coberturas y quién las realiza.</Typography></Box>{rows.length===0?<Empty icon={<HistoryRounded/>} text="Aún no hay ausencias registradas."/>:<Stack divider={<Divider flexItem/>}>{rows.map(a=>{const teacher=teacherName(a.absent_teacher_id);const slot=slots.find(s=>s.id===a.timeslot_id);const substitute=a.substitute_teacher_id?teacherName(a.substitute_teacher_id):'Pendiente';return <Stack key={a.id} direction="row" justifyContent="space-between" alignItems="center" sx={{p:2.25}}><Box><Typography fontWeight={750}>{teacher}</Typography><Typography variant="body2" color="text.secondary">{new Date(a.date+'T00:00:00').toLocaleDateString('es-ES')} · {slot?`${dayShort[slot.weekday]} · ${slotRange(slot)}`:'Sesión'} · {groupName(a.class_group_id)} · {classroomName(a.classroom_id)}</Typography><Typography variant="caption" color="text.secondary">Sustituye: {substitute}</Typography></Box><Chip color={a.substitute_teacher_id?'success':'warning'} size="small" label={a.substitute_teacher_id?'Cubierta':'Pendiente'}/></Stack>})}</Stack>}</Paper>}
 function Stats({admin,currentTeacherId}:{admin:boolean;currentTeacherId?:number}){
