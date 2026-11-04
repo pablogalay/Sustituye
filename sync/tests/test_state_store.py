@@ -1,4 +1,5 @@
 from educamadrid_sync.state_store import (
+    drop_malformed_rows,
     load_imported_ids,
     load_pending,
     mark_imported,
@@ -26,6 +27,19 @@ def test_merge_new_rows_skips_rows_without_id():
     rows = [{"id": "", "x": "a"}, {"x": "b"}]
     pending = merge_new_rows(rows, "id", pending={}, imported_ids=set())
     assert pending == {}
+
+
+def test_drop_malformed_rows_removes_only_ids_that_are_not_response_numbers():
+    pending = {
+        "228": {"x": "valid"},
+        'Muchas gracias"': {"x": "text fragment"},
+        '2. Hacer la ficha"': {"x": "fragment starting with a number"},
+        "": {"x": "blank id"},
+    }
+    cleaned = drop_malformed_rows(pending)
+    assert cleaned == {"228": {"x": "valid"}}
+    # input is not mutated
+    assert len(pending) == 4
 
 
 def test_mark_imported_removes_from_pending_and_adds_to_ledger():

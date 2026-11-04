@@ -7,6 +7,7 @@ import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
 
 from educamadrid_sync import run as run_module
@@ -145,6 +146,74 @@ def test_run_continues_processing_remaining_rows_after_one_fails(tmp_path):
 
     assert result == {"fetched": 2, "complete": 2, "imported": 1, "pending": 1}
     assert client.create_absence.call_count == 2
+
+
+def test_run_continues_after_a_row_with_a_missing_username(tmp_path):
+    client = _fake_app_client()
+    rows = [_row(row_id="1", Q01=None), _row(row_id="2")]
+    result, settings = _run_with(tmp_path, rows, client)
+
+    assert result == {"fetched": 2, "complete": 2, "imported": 1, "pending": 1}
+    pending = json.loads(settings.pending_responses_path.read_text(encoding="utf-8"))
+    assert list(pending) == ["1"]
+
+
+def test_run_continues_after_an_unexpected_error_on_one_row(tmp_path):
+    def side_effect(payload):
+        if payload["class_group"] == "BAD_RESPONSE":
+            raise ValueError("the API answered with invalid JSON")
+        return {"id": 1}
+
+    client = _fake_app_client(create_absence_side_effect=side_effect)
+    rows = [_row(row_id="1", Q04="BAD_RESPONSE"), _row(row_id="2", Q04="OK")]
+    result, settings = _run_with(tmp_path, rows, client)
+
+    assert result == {"fetched": 2, "complete": 2, "imported": 1, "pending": 1}
+    client.close.assert_called_once()
+    pending = json.loads(settings.pending_responses_path.read_text(encoding="utf-8"))
+    assert list(pending) == ["1"]
+    imported = json.loads(settings.imported_ids_path.read_text(encoding="utf-8"))
+    assert imported == {"imported_ids": ["2"]}
+
+
+def test_run_stops_at_the_first_row_when_the_api_is_unreachable(tmp_path):
+    """An outage is not the row's fault: trying every remaining row would only
+    add one network timeout per row before reporting the same failure."""
+    client = _fake_app_client(create_absence_side_effect=httpx.ConnectError("connection refused"))
+    rows = [_row(row_id="1"), _row(row_id="2")]
+    settings = _make_settings(tmp_path)
+    with patch("educamadrid_sync.run.get_settings", return_value=settings), \
+         patch("educamadrid_sync.run.browser_login.login", return_value={"cookies": []}), \
+         patch("educamadrid_sync.run.limesurvey_export.fetch_responses", return_value=rows), \
+         patch("educamadrid_sync.run.AppClient", return_value=client):
+        with pytest.raises(httpx.ConnectError):
+            run_module.run()
+
+    assert client.create_absence.call_count == 1
+    pending = json.loads(settings.pending_responses_path.read_text(encoding="utf-8"))
+    assert set(pending) == {"1", "2"}
+
+
+def test_run_purges_text_fragment_saved_as_pending_by_an_earlier_version(tmp_path):
+    """Such a fragment was persisted before the CSV parsing fix, and would stay
+    in pending_responses.json forever because it never matches a real response."""
+    settings = _make_settings(tmp_path)
+    fragment_id = 'Muchas gracias"'
+    fragment = {"id": fragment_id, "submitdate": "57.2", "Q01": None}
+    settings.pending_responses_path.write_text(
+        json.dumps({fragment_id: fragment, "7": _row(row_id="7")}), encoding="utf-8"
+    )
+    client = _fake_app_client()
+    with patch("educamadrid_sync.run.get_settings", return_value=settings), \
+         patch("educamadrid_sync.run.browser_login.login", return_value={"cookies": []}), \
+         patch("educamadrid_sync.run.limesurvey_export.fetch_responses", return_value=[]), \
+         patch("educamadrid_sync.run.AppClient", return_value=client):
+        result = run_module.run()
+
+    assert result == {"fetched": 0, "complete": 0, "imported": 1, "pending": 0}
+    assert json.loads(settings.pending_responses_path.read_text(encoding="utf-8")) == {}
+    imported = json.loads(settings.imported_ids_path.read_text(encoding="utf-8"))
+    assert imported == {"imported_ids": ["7"]}
 
 
 def test_run_pending_row_is_retried_on_a_later_call(tmp_path):

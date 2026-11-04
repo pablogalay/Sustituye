@@ -86,7 +86,11 @@ def _column(row: dict, columns: dict, field: str) -> str:
     code = columns.get(field)
     if code is None:
         raise MappingError(f"field_mapping.json has no column configured for '{field}'")
-    value = row.get(code, "")
+    value = row.get(code)
+    # csv.DictReader sets the columns a short row lacks to None; report those as
+    # empty so the caller raises MappingError instead of crashing the whole run.
+    if value is None:
+        return ""
     return value.strip() if isinstance(value, str) else value
 
 

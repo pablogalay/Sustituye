@@ -4,7 +4,46 @@ from unittest.mock import MagicMock, patch
 import pytest
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
-from educamadrid_sync.limesurvey_export import ExportError, fetch_responses
+from educamadrid_sync.limesurvey_export import ExportError, _parse_csv, fetch_responses
+
+# Real answer that broke production: LimeSurvey exports its inner quotes doubled
+# (""a""). It sits after the 2048-character sniffing sample, so nothing in that
+# sample reveals that the export escapes quotes by doubling them.
+QUOTED_TASK = (
+    'Hola, por favor: quien no los tuviese que termine los deberes del puente y, para todos, '
+    'los apartados "a" al "e", ambos incluidos, de la segunda hoja del siguiente documento: '
+    "https://www.matematicasonline.es/terceroeso/ejercicios/polinomios-division.pdf"
+)
+EXPORT_HEADER = (
+    '"ID de respuesta","Fecha de envío","Usuario","Tareas","Tiempo total","Temporización"\n'
+)
+
+
+def _export_row(response_id: int, task: str) -> str:
+    escaped_task = task.replace('"', '""')
+    return f'"{response_id}","2026-10-20 10:00:00","ana.garcia","{escaped_task}","57.2","10"\n'
+
+
+def _export_with_final_task(task: str) -> str:
+    plain_rows = "".join(_export_row(i, "Ejercicios del libro") for i in range(1, 41))
+    return EXPORT_HEADER + plain_rows + _export_row(41, task)
+
+
+@pytest.mark.parametrize("task", [
+    pytest.param(QUOTED_TASK + " Muchas gracias", id="single-line"),
+    pytest.param(QUOTED_TASK + "\nMuchas gracias", id="line-break"),
+])
+def test_doubled_quotes_after_the_sniffing_sample_keep_the_answer_in_one_row(task):
+    content = _export_with_final_task(task)
+    assert '""a""' not in content[:2048]  # guards the scenario: the sample has no doubled quotes
+
+    rows = _parse_csv(content)
+
+    assert [row["ID de respuesta"] for row in rows] == [str(i) for i in range(1, 42)]
+    last = rows[-1]
+    assert last["Tareas"] == task
+    assert last["Tiempo total"] == "57.2"
+    assert None not in last  # no overflow fields from misplaced separators
 
 
 def _fake_page_with_download(csv_path) -> MagicMock:

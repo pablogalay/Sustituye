@@ -52,6 +52,11 @@ def _parse_csv(content: str) -> list[dict]:
     sample = content[:2048]
     try:
         dialect = csv.Sniffer().sniff(sample, delimiters=";,\t")
+        # The sniffer only reports doublequote=True if the sample happens to
+        # contain a doubled quote. LimeSurvey always escapes quotes that way, so
+        # a later answer like 'apartados "a" al "e"' would otherwise close its
+        # field early and split on its commas and line breaks.
+        dialect.doublequote = True
     except csv.Error:
         dialect = csv.excel
         dialect.delimiter = ";"

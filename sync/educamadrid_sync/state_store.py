@@ -51,6 +51,20 @@ def merge_new_rows(
     return merged
 
 
+def drop_malformed_rows(pending: dict[str, dict]) -> dict[str, dict]:
+    """Remove entries whose id is not a LimeSurvey response number. These are
+    pieces of free text that a CSV parsing error once turned into fake rows; they
+    can never be imported and no later export would replace them. Returns a new
+    dict; does not mutate `pending`."""
+    cleaned = {}
+    for response_id, row in pending.items():
+        if response_id.isdigit():
+            cleaned[response_id] = row
+        else:
+            logger.warning("Discarding malformed pending row with id %r", response_id)
+    return cleaned
+
+
 def mark_imported(
     response_id: str,
     pending: dict[str, dict],

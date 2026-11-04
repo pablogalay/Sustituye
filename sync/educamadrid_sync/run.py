@@ -1,6 +1,8 @@
 import logging
 import sys
 
+import httpx
+
 from . import browser_login, limesurvey_export, mapping, state_store
 from .app_client import AppClient, AppClientError
 from .settings import get_settings
@@ -47,6 +49,7 @@ def run() -> dict:
     # Persist fetched responses to the local pending file *before* touching the
     # app API, so a later failure never loses data already pulled from EducaMadrid.
     pending = state_store.merge_new_rows(complete_rows, response_id_column, pending, imported_ids)
+    pending = state_store.drop_malformed_rows(pending)
     state_store.save_pending(settings.pending_responses_path, pending)
 
     client = AppClient(settings.app_api_url, settings.admin_email, settings.admin_password)
@@ -62,6 +65,13 @@ def run() -> dict:
             client.create_absence(payload)
         except (mapping.MappingError, AppClientError) as exc:
             logger.warning("Leaving response %s pending: %s", response_id, exc)
+            error_count += 1
+            continue
+        except httpx.TransportError:
+            # The API is unreachable, so every remaining row would fail the same way.
+            raise
+        except Exception:
+            logger.exception("Leaving response %s pending after an unexpected error", response_id)
             error_count += 1
             continue
 

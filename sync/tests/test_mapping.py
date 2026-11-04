@@ -214,6 +214,21 @@ def test_malformed_time_token_raises(bad_period):
         map_response_to_absence(row, FIELD_MAPPING, teacher_lookup, timeslot_lookup)
 
 
+@pytest.mark.parametrize("column, error", [
+    ("Q01", "no username"),
+    ("Q02", "date format"),
+    ("Q03", "hour range"),
+    ("Q04", "are all required"),
+])
+def test_column_missing_from_a_short_csv_row_raises_mapping_error(column, error):
+    """csv.DictReader fills the columns a short row lacks with None."""
+    teacher_lookup = build_teacher_lookup(TEACHERS)
+    timeslot_lookup = build_timeslot_lookup(TIMESLOTS)
+    row = make_row(**{column: None})
+    with pytest.raises(MappingError, match=error):
+        map_response_to_absence(row, FIELD_MAPPING, teacher_lookup, timeslot_lookup)
+
+
 def test_missing_column_mapping_for_a_required_field_raises():
     teacher_lookup = build_teacher_lookup(TEACHERS)
     timeslot_lookup = build_timeslot_lookup(TIMESLOTS)
