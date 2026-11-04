@@ -133,8 +133,6 @@ def create_absence(payload:AbsenceIn,request:Request,db:Session=Depends(get_db))
     ))
     if duplicate: raise HTTPException(409,'Ya existe una sustitución idéntica registrada')
     absence=Absence(date=payload.date,timeslot_id=payload.timeslot_id,absent_teacher_id=payload.absent_teacher_id,class_group_id=group.id,classroom_id=classroom.id,task_left=payload.task_left,observations=payload.observations)
-    absence.class_group=group_name
-    absence.classroom=classroom_name
     db.add(absence); db.flush()
 
     # This teacher may already be covering someone else's absence in this same
@@ -197,14 +195,25 @@ def force_assign_absence(absence_id:int,payload:AbsenceManualAssignIn,request:Re
         Absence.date==absence.date, Absence.timeslot_id==absence.timeslot_id,
         Absence.substitute_teacher_id==substitute.id, Absence.id!=absence.id,
     ))
+    # Released and flushed FIRST, freeing `substitute` from the DB's uniqueness
+    # constraint (date, timeslot, substitute) before `absence` claims that same slot below.
     if conflicting:
         release_substitute_credit(db,substitute.id,absence.timeslot_id)
         conflicting.substitute_teacher_id=None
         db.flush()
+
+    # Assigned and flushed BEFORE the backfill below runs: assign_substitute()'s own
+    # "occupied" check reads Absence.substitute_teacher_id directly, so `substitute`
+    # must already show up there as covering `absence`, or the backfill could pick
+    # them straight back onto `conflicting` too, double-booking the same teacher into
+    # both absences at this exact date/session.
+    absence.substitute_teacher_id=substitute.id
+    db.flush()
+
+    if conflicting:
         conflicting.substitute_teacher_id=assign_substitute(db,conflicting)
         db.flush()
 
-    absence.substitute_teacher_id=substitute.id
     # Unconditional: credit_manual_assignment() doesn't check GUARD/SUPPORT availability,
     # which is exactly the bypass this endpoint requires.
     credit_manual_assignment(db,substitute.id,absence.timeslot_id)
@@ -214,11 +223,6 @@ def force_assign_absence(absence_id:int,payload:AbsenceManualAssignIn,request:Re
     # freed-up absence below) was staffing one.
     assign_hallway_duties(db,absence.date,absence.timeslot_id)
     db.commit(); db.refresh(absence)
-    # class_group/classroom are transient (not mapped columns); send_substitution_email
-    # reads them via getattr and falls back to 'no disponible' if they are not set.
-    group=db.get(ClassGroup,absence.class_group_id); classroom=db.get(Classroom,absence.classroom_id)
-    absence.class_group=group.name if group else None
-    absence.classroom=classroom.name if classroom else None
     send_substitution_email(db,absence,substitute.id)
     if conflicting:
         db.refresh(conflicting)
@@ -272,11 +276,6 @@ def update_absence(absence_id:int,payload:AbsenceUpdateIn,request:Request,db:Ses
         absence.classroom_id=classroom.id
     db.commit(); db.refresh(absence)
     if absence.substitute_teacher_id is not None:
-        # class_group/classroom are transient (not mapped columns); send_absence_updated_email
-        # reads them via getattr and falls back to 'no disponible' if they are not set.
-        group=db.get(ClassGroup,absence.class_group_id); classroom=db.get(Classroom,absence.classroom_id)
-        absence.class_group=group.name if group else None
-        absence.classroom=classroom.name if classroom else None
         send_absence_updated_email(db,absence,absence.substitute_teacher_id)
     return absence
 @app.put('/absences/{absence_id}',response_model=AbsenceOut)
@@ -348,6 +347,8 @@ def admin_update_absence(absence_id:int,payload:AdminAbsenceUpdateIn,request:Req
         # The new substitute may already be covering a different absence in the new
         # date/session; assigning them here too would silently double their commitment,
         # so that older assignment is released first (and, best-effort, backfilled).
+        # Released and flushed FIRST, freeing `new_substitute` from the DB's uniqueness
+        # constraint (date, timeslot, substitute) before `absence` claims that slot below.
         conflicting=None
         if assign_needed:
             conflicting=db.scalar(select(Absence).where(
@@ -358,11 +359,12 @@ def admin_update_absence(absence_id:int,payload:AdminAbsenceUpdateIn,request:Req
                 release_substitute_credit(db,new_substitute.id,payload.timeslot_id)
                 conflicting.substitute_teacher_id=None
                 db.flush()
-                conflicting.substitute_teacher_id=assign_substitute(db,conflicting)
-                db.flush()
 
-        if release_needed: release_substitute_credit(db,old_substitute_id,old_timeslot_id)
-
+        # UPDATE applied and flushed BEFORE the conflict backfill below: assign_substitute()'s
+        # own "occupied" check reads Absence.substitute_teacher_id/date/timeslot_id directly,
+        # so `absence` must already show the NEW date/session/substitute here, or the backfill
+        # could pick `new_substitute` straight back onto `conflicting` too, double-booking the
+        # same teacher into both absences at this exact date/session.
         absence.date=payload.date
         absence.timeslot_id=payload.timeslot_id
         absence.class_group_id=group.id
@@ -371,6 +373,12 @@ def admin_update_absence(absence_id:int,payload:AdminAbsenceUpdateIn,request:Req
         absence.observations=payload.observations
         absence.substitute_teacher_id=new_substitute.id if new_substitute else None
         db.flush()
+
+        if conflicting:
+            conflicting.substitute_teacher_id=assign_substitute(db,conflicting)
+            db.flush()
+
+        if release_needed: release_substitute_credit(db,old_substitute_id,old_timeslot_id)
 
         # Unconditional: credit_manual_assignment() doesn't check GUARD/SUPPORT
         # availability, which is exactly the bypass this endpoint requires.
@@ -386,11 +394,6 @@ def admin_update_absence(absence_id:int,payload:AdminAbsenceUpdateIn,request:Req
         db.rollback()
         raise
     db.refresh(absence)
-
-    # class_group/classroom are transient (not mapped columns); the notification
-    # helpers read them via getattr and fall back to 'no disponible' if unset.
-    absence.class_group=group.name
-    absence.classroom=classroom.name
 
     if release_needed:
         send_substitution_cancelled_email(db,old_snapshot,old_substitute_id)

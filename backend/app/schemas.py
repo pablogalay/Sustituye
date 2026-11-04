@@ -38,7 +38,7 @@ class AbsenceUpdateIn(BaseModel):
     # recreate the absence instead of editing them in place.
     task_left: str | None = None
     classroom: str | None = None
-class AbsenceOut(BaseModel): id:int; date:date; timeslot_id:int; absent_teacher_id:int; class_group_id:int; classroom_id:int; task_left:str; observations:str|None; substitute_teacher_id:int|None; created_at:datetime; model_config=ConfigDict(from_attributes=True)
+class AbsenceOut(BaseModel): id:int; date:date; timeslot_id:int; absent_teacher_id:int; class_group_id:int; class_group_name:str|None=None; classroom_id:int; classroom_name:str|None=None; task_left:str; observations:str|None; substitute_teacher_id:int|None; created_at:datetime; model_config=ConfigDict(from_attributes=True)
 class AdminAbsenceUpdateIn(BaseModel):
     # A full administrative replace: unlike AbsenceUpdateIn (the teacher's own
     # task/classroom-only PATCH), every editable field is required here since this is

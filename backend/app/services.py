@@ -176,6 +176,14 @@ def _deliver_email(db:Session, message:EmailMessage, log_context:str) -> bool:
         db.commit()
         return False
 
+def _place_names(absence) -> tuple[str,str]:
+    """Group and classroom names for a notification. ORM absences read them from the DB
+    (class_group_name/classroom_name); plain snapshots of an absence that has since been
+    edited or deleted carry them as class_group/classroom instead."""
+    group=getattr(absence,'class_group_name',None) or getattr(absence,'class_group',None)
+    classroom=getattr(absence,'classroom_name',None) or getattr(absence,'classroom',None)
+    return group or 'no disponible', classroom or 'no disponible'
+
 def send_substitution_email(db:Session, absence:Absence, substitute_teacher_id:int) -> bool:
     substitute=db.get(Teacher, substitute_teacher_id)
     absent=db.get(Teacher, absence.absent_teacher_id)
@@ -184,8 +192,7 @@ def send_substitution_email(db:Session, absence:Absence, substitute_teacher_id:i
         logger.warning('Skipping substitution email because related records are missing for absence_id=%s', absence.id)
         return False
 
-    group_name=getattr(absence,'class_group',None) or 'no disponible'
-    classroom_name=getattr(absence,'classroom',None) or 'no disponible'
+    group_name,classroom_name=_place_names(absence)
 
     message=EmailMessage()
     message['Subject']=f'[NUEVA ASIGNACIÓN] Sustitución asignada: {time_slot.weekday} sesión {time_slot.period_number}'
@@ -218,8 +225,7 @@ def send_substitution_cancelled_email(db:Session, absence, substitute_teacher_id
         logger.warning('Skipping cancellation email because related records are missing for absence_id=%s', absence.id)
         return False
 
-    group_name=getattr(absence,'class_group',None) or 'no disponible'
-    classroom_name=getattr(absence,'classroom',None) or 'no disponible'
+    group_name,classroom_name=_place_names(absence)
 
     message=EmailMessage()
     message['Subject']=f'[CANCELACIÓN] Sustitución cancelada: {time_slot.weekday} sesión {time_slot.period_number}'
@@ -251,8 +257,7 @@ def send_absence_updated_email(db:Session, absence, substitute_teacher_id:int) -
         logger.warning('Skipping absence-update email because related records are missing for absence_id=%s', absence.id)
         return False
 
-    group_name=getattr(absence,'class_group',None) or 'no disponible'
-    classroom_name=getattr(absence,'classroom',None) or 'no disponible'
+    group_name,classroom_name=_place_names(absence)
 
     message=EmailMessage()
     message['Subject']=f'[ACTUALIZACIÓN] Tarea modificada para tu guardia en {group_name}'

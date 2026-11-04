@@ -1,6 +1,6 @@
 from datetime import date, datetime, time
 from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Integer, String, Text, Time, UniqueConstraint
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 from .database import Base
 class Teacher(Base):
     __tablename__='teachers'
@@ -24,6 +24,14 @@ class AssignmentStatistic(Base):
 class Absence(Base):
     __tablename__='absences'; __table_args__=(UniqueConstraint('date','timeslot_id','substitute_teacher_id'),)
     id: Mapped[int]=mapped_column(primary_key=True); date: Mapped[date]=mapped_column(Date); timeslot_id: Mapped[int]=mapped_column(ForeignKey('timeslots.id')); absent_teacher_id: Mapped[int]=mapped_column(ForeignKey('teachers.id')); class_group_id: Mapped[int]=mapped_column(ForeignKey('class_groups.id')); classroom_id: Mapped[int]=mapped_column(ForeignKey('classrooms.id')); task_left: Mapped[str]=mapped_column(Text); observations: Mapped[str|None]=mapped_column(Text,nullable=True); substitute_teacher_id: Mapped[int|None]=mapped_column(ForeignKey('teachers.id'),nullable=True); created_at: Mapped[datetime]=mapped_column(DateTime,default=datetime.utcnow)
+    # Read-only lookups of the group/classroom names, so API responses and notification
+    # emails always carry them straight from the DB instead of depending on callers to
+    # attach them by hand (or on clients' possibly stale cached group/classroom lists).
+    group_ref: Mapped[ClassGroup]=relationship(viewonly=True,lazy='selectin'); classroom_ref: Mapped[Classroom]=relationship(viewonly=True,lazy='selectin')
+    @property
+    def class_group_name(self) -> str|None: return self.group_ref.name if self.group_ref else None
+    @property
+    def classroom_name(self) -> str|None: return self.classroom_ref.name if self.classroom_ref else None
 class HallwayDuty(Base):
     __tablename__='hallway_duties'; __table_args__=(UniqueConstraint('date','timeslot_id','post'),)
     # weight stores the assigned teacher's duty_weight at assignment time, so the load
